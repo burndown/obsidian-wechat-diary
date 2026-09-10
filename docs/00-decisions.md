@@ -656,15 +656,23 @@ README 与 data-contract 里对这条例外都要写明。
 **没做**：不做「总结昨天」「总结某一天」的日期参数——需要时再加，现在加会引入日期解析这一整摊
 歧义（「总结上周」算不算？）。不做定时任务的删除，只把它默认关掉、留成可选。
 
-**版本号**：0.5.0。注意 `15-daily-note-mode-draft.md` 的原计划把 0.5.0 留给了 #14「切换文件夹」，
-本轮先用掉，#14 顺延到下一个版本号。仓库的发版惯例是只 bump `manifest.json` + `versions.json`——
-`main.js` 里的 `PLUGIN_VERSION` 是协议头里的 agent 串，自 0.3.0 起不随发版变动（0.3.1 与 0.4.0 两次发版均未动）。
+**版本号与发版位置（2026-09-10 更正）**：0.5.0。`15-daily-note-mode-draft.md` 的原计划把 0.5.0 留给了
+#14「切换文件夹」，本轮先用掉，#14 顺延。发版惯例是只 bump `manifest.json` + `versions.json`——
+`main.js` 里的 `PLUGIN_VERSION` 是协议头里的 agent 串，自 0.3.0 起不随发版变动（0.3.1 与 0.4.0 均未动）。
 
-**0.5.0 同时是仓库的第一个 tag + Release**：0.1.0–0.4.0 都只 bump 了 main 上的 `manifest.json`，
-从未打过 tag（`15-daily-note-mode-draft.md` 里写的「三件套照发」当时只是计划，没执行）。
-从这版起走 Release 分发：tag `0.5.0` 指向 `808c1fb`，Release 附 `main.js` / `manifest.json` / `styles.css`
-三件套（已核对与仓库文件逐字节一致），BRAT 可以按 `burndown/obsidian-wechat-diary` 装了。
-后续版本沿用这条路径即可。
+⚠️ **更正一处早先写错的判断**：本文原先写着「0.5.0 是仓库的第一个 tag + Release，0.1.0–0.4.0 从未打过 tag」。
+那是**只在 fork 上成立**的观察——`burndown/obsidian-wechat-diary` 是 `ArtemisLin/obsidian-wechat-diary`
+的 fork（`fork: true`，parent/source 都是它），而 **GitHub 的 fork 不继承 release 与 tag**，所以在 fork 里
+`gh release list` / `git ls-remote --tags` 都是空的，我据此误推到了整个项目。
+真实情况：**上游 `ArtemisLin/obsidian-wechat-diary` 一直有正式 release**——0.1.0 / 0.1.1 / 0.1.2 / 0.1.3 /
+0.3.0 / 0.3.1 / 0.4.0-beta.1…4 / 0.4.0 共 11 个 tag+release，「三件套照发」是**一直在执行**的，不是计划。
+
+**因此有两条必须记住的事实**：
+- **商店条目 (`community-plugins.json`) 的 `repo` 指向上游 `artemislin/obsidian-wechat-diary`**，
+  商店给用户的版本 = 那里的 `manifest.json` = **0.4.0**。在 fork 上发的 0.5.0/0.6.x/0.7.0
+  **商店用户一个都收不到**——只能在 fork 的 Release 里手动装或走 BRAT。
+- 想让新功能进商店，要么把改动合进上游仓库、要么改商店登记指向的 repo。这是分发问题，不是代码问题。
+
 
 ---
 
