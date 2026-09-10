@@ -1894,6 +1894,213 @@ async function newPlugin(secrets, storedData) {
     }
   }
 
+  console.log("\n【D16】自定义提示词(2026-09-10): 多条 / 各有触发词与自己的节 / 内置永远优先");
+  {
+    const RDate2 = Date;
+    let dNow2 = RDate2.parse("2026-09-13T10:00:00+08:00");
+    class DDate2 extends RDate2 {
+      constructor(...a) { if (a.length) super(...a); else super(dNow2); }
+      static now() { return dNow2; }
+    }
+    global.Date = DDate2;
+    I.setDayStartHour(4);
+    const DAY2 = "2026-09-13";
+    const SECRET_AI2 = "wechat-diary-ai-api-key";
+    function dv2() {
+      const files = {};
+      return {
+        files,
+        getFileByPath: (x) => (x in files ? { path: x } : null),
+        getAbstractFileByPath: (x) => (x in files ? { path: x } : null),
+        getFolderByPath: () => ({}), createFolder: async () => {},
+        create: async (x, c) => { files[x] = c; },
+        process: async (f, fn) => { files[f.path] = fn(files[f.path]); return files[f.path]; },
+        cachedRead: async (f) => files[f.path],
+      };
+    }
+    const mkPromptPlugin = async (prompts, vault) => {
+      const p = await newPlugin({ [SECRET_AI2]: "K1", [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+      p.app.vault = vault;
+      p.settings.aiApiUrl = "https://api.example.com/v1/chat/completions";
+      p.settings.aiModel = "test-model";
+      p.settings.aiSummaryEnabled = true;
+      p.settings.aiPrompts = prompts;
+      return p;
+    };
+    try {
+      console.log("  — D16.1 触发词匹配(与内置命令共用一套归一化)");
+      const PROMPTS = [{ keyword: "待办", prompt: "抽未完成事项", heading: "AI 待办" }];
+      for (const kw of ["待办", "待办吧", "待办！", "“待办”", "待办。"]) {
+        check("D16 「" + kw + "」命中自定义提示词", !!I.matchCustomPrompt(kw, PROMPTS), kw);
+      }
+      check("D16 没配任何自定义 → 不命中", I.matchCustomPrompt("待办", []) === null && I.matchCustomPrompt("待办", null) === null);
+      check("D16 长句里的关键词不算(仍是内容)", I.matchCustomPrompt("明天把待办都清一遍", PROMPTS) === null);
+      check("D16 不相干的短句不命中", I.matchCustomPrompt("今天很累", PROMPTS) === null);
+      check("D16 大小写/空白归一(存小写)", !!I.matchCustomPrompt("  TODO  ", [{ keyword: "todo", prompt: "p", heading: "AI Todo" }]));
+      check("D16 命中时返回的是那一条本身", I.matchCustomPrompt("待办", PROMPTS) === PROMPTS[0]);
+
+      console.log("  — D16.2 提示词模板: 不写 {entries} 也要把记录接上去");
+      const tplOut = I.renderPromptTemplate("看这些: {entries}\n日期 {day} {weekday}", { day: DAY2, weekday: "周日", entries: "素材A" });
+      check("D16 三个占位符都替换", tplOut === "看这些: 素材A\n日期 2026-09-13 周日", JSON.stringify(tplOut));
+      const tplNo = I.renderPromptTemplate("整理成待办清单。", { day: DAY2, weekday: "周日", entries: "素材A" });
+      check("D16 没写 {entries} → 记录自动接在末尾(否则模型看不到记录)", tplNo === "整理成待办清单。\n\n素材A", JSON.stringify(tplNo));
+      check("D16 多个 {entries} 都替换", I.renderPromptTemplate("{entries}|{entries}", { entries: "X" }) === "X|X");
+      check("D16 只有 {day} 也照样接记录", I.renderPromptTemplate("{day} 的清单", { day: "D", entries: "X" }) === "D 的清单\n\nX");
+
+      console.log("  — D16.3 多节摘除(素材里不许混进别的 AI 产物)");
+      const multi = "记录一\n\n## AI 总结\n\n总结正文\n\n## AI 待办\n\n待办正文\n";
+      const stripped = I.stripAiSections(multi, ["AI 总结", "AI 待办"]);
+      check("D16 两个 AI 节都被摘掉, 节外的记录保留", !stripped.includes("总结正文") && !stripped.includes("待办正文") && stripped.includes("记录一"), JSON.stringify(stripped));
+      // 节边界规则: 节的身体到"下一个任意级别标题"为止。所以写在两个 AI 节**之间**的内容属于前一个
+      // AI 节, 摘节时会跟着走、重算时会被覆盖——这是覆盖式派生节契约的直接后果, 已写进设置页与 README。
+      const between = "记录一\n\n## AI 总结\n\n总结正文\n\n记录二\n\n## AI 待办\n\n待办正文\n";
+      check("D16 写在两个 AI 节之间的内容按节边界归前一个 AI 节 → 一并摘掉(与覆盖式契约一致)",
+        !I.stripAiSections(between, ["AI 总结", "AI 待办"]).includes("记录二"), JSON.stringify(I.stripAiSections(between, ["AI 总结", "AI 待办"])));
+      const plain = "记录一\n\n记录二\n";
+      check("D16 没有 AI 节时逐字节不动", I.stripAiSections(plain, ["AI 总结"]) === plain);
+      check("D16 空清单/空内容不炸", I.stripAiSections(plain, []) === plain && I.stripAiSections("", ["AI 总结"]) === "");
+      check("D16 同名节出现两次都被摘掉", !I.stripAiSections("a\n\n## AI 待办\n\nx\n\n## AI 待办\n\ny\n", ["AI 待办"]).includes("x"));
+
+      console.log("  — D16.4 触发词校验(内置命令词与重复都要拦)");
+      check("D16 空 → 拒", I.validatePromptKeyword("", [], "").ok === false);
+      check("D16 换行 → 拒", I.validatePromptKeyword("待\n办", [], "").ok === false);
+      check("D16 超 15 字 → 拒", I.validatePromptKeyword("一二三四五六七八九十一二三四五六", [], "").ok === false);
+      for (const bad of ["撤回", "结束", "晚安", "在吗", "帮助", "总结", "继续"]) {
+        const r = I.validatePromptKeyword(bad, [], "");
+        check("D16 内置命令词「" + bad + "」→ 拒", r.ok === false && r.error.includes("内置命令词"), JSON.stringify(r));
+      }
+      check("D16 「记：待办」→ 拒(逃生口前缀)", I.validatePromptKeyword("记：待办", [], "").ok === false);
+      check("D16 和别的条目重复 → 拒", I.validatePromptKeyword("待办", ["待办"], "").ok === false);
+      check("D16 和自己相同 → 放行(改别的字段时不误伤)", I.validatePromptKeyword("待办", ["待办"], "待办").ok === true);
+      check("D16 合法值归一后返回", I.validatePromptKeyword("  待办吧  ", [], "").value === "待办", JSON.stringify(I.validatePromptKeyword("  待办吧  ", [], "")));
+      check("D16 英文归一成小写", I.validatePromptKeyword("TODO", [], "").value === "todo");
+
+      console.log("  — D16.5 节标题校验(撞了会搞乱记录区, 必须硬拦)");
+      const hOpts = { sectionHeading: "微信随手记", summaryHeading: "AI 总结", others: ["AI 待办"], self: "" };
+      check("D16 空 → 拒", I.validatePromptHeading("", hOpts).ok === false);
+      check("D16 撞记录节 → 拒", I.validatePromptHeading("微信随手记", hOpts).ok === false);
+      check("D16 撞内置总结节 → 拒", I.validatePromptHeading("AI 总结", hOpts).ok === false);
+      check("D16 撞别的自定义节 → 拒", I.validatePromptHeading("AI 待办", hOpts).ok === false);
+      check("D16 和自己相同 → 放行", I.validatePromptHeading("AI 待办", Object.assign({}, hOpts, { self: "AI 待办" })).ok === true);
+      check("D16 前导 # 被剥掉", I.validatePromptHeading("## AI 周报", hOpts).value === "AI 周报");
+      check("D16 换行 → 拒", I.validatePromptHeading("AI\n周报", hOpts).ok === false);
+      check("D16 默认值 aiPrompts = []", Array.isArray(I.DEFAULT_SETTINGS.aiPrompts) && I.DEFAULT_SETTINGS.aiPrompts.length === 0);
+
+      console.log("  — D16.6 真 DiaryWriter: 每条写自己的节, 互不覆盖");
+      const v2 = dv2();
+      const W2 = new I.DiaryWriter({ app: { vault: v2 }, settings: { diaryFolder: "日记", aiSummaryHeading: "AI 总结", aiPrompts: [{ keyword: "待办", prompt: "p", heading: "AI 待办" }] } }, null);
+      check("D16 _aiHeadings 含内置总结与各条自定义", JSON.stringify(W2._aiHeadings()) === JSON.stringify(["AI 总结", "AI 待办"]), JSON.stringify(W2._aiHeadings()));
+      await W2.write("上午修了水管", false, DAY2);
+      await W2.writeSummary(DAY2, "总结正文A", { model: "m", time: "t", blocks: 1 });
+      await W2.writeSummary(DAY2, "待办正文B", { model: "m", time: "t", blocks: 1 }, "AI 待办");
+      const file2 = v2.files[W2.diaryPath(DAY2)];
+      check("D16 两个节都在同一个文件里", file2.includes("## AI 总结") && file2.includes("## AI 待办"), file2);
+      check("D16 互不覆盖", file2.includes("总结正文A") && file2.includes("待办正文B"), file2);
+      check("D16 readSummary 按标题各读各的", (await W2.readSummary(DAY2, "AI 待办")) === "待办正文B", JSON.stringify(await W2.readSummary(DAY2, "AI 待办")));
+      check("D16 不传标题仍是内置总结节(老调用点不受影响)", (await W2.readSummary(DAY2)) === "总结正文A");
+      const src2 = await W2.readSummarySource(DAY2);
+      check("D16 素材里两条 AI 产物都被摘掉, 只剩记录",
+        src2.blocks === 1 && src2.text.includes("修了水管") && !src2.text.includes("总结正文A") && !src2.text.includes("待办正文B"), JSON.stringify(src2));
+      await W2.writeSummary(DAY2, "待办正文B2", { model: "m", time: "t", blocks: 1 }, "AI 待办");
+      check("D16 重算某一条 = 覆盖它自己那一节, 不动别的节",
+        file2 !== v2.files[W2.diaryPath(DAY2)] && v2.files[W2.diaryPath(DAY2)].includes("待办正文B2") && v2.files[W2.diaryPath(DAY2)].includes("总结正文A") && !v2.files[W2.diaryPath(DAY2)].includes("待办正文B\n"), v2.files[W2.diaryPath(DAY2)]);
+      check("D16 段数不被任何 AI 节污染", (await W2.countDay(DAY2)) === 1, String(await W2.countDay(DAY2)));
+
+      console.log("  — D16.7 全链路: 发触发词 → 真跑一次模型 → 写自己的节");
+      const v3 = dv2();
+      const pd = await mkPromptPlugin([{ keyword: "待办", prompt: "只留还没做完的事。", heading: "AI 待办" }], v3);
+      let sentBody = null;
+      requestUrlImpl = async (opts) => {
+        sentBody = JSON.parse(opts.body);
+        return { status: 200, json: { choices: [{ message: { content: "待办:\n- 修水管" } }] }, text: "" };
+      };
+      await pd.writer.write("上午修了水管, 还没修好", false, DAY2);
+      await pd.writer.write("下午买了菜", false, DAY2);
+      const rep = await pd.agent._dispatch("待办", false, [], null);
+      check("D16 真的把用户提示词发给了模型", !!sentBody && sentBody.messages[0].content.includes("只留还没做完的事。"), JSON.stringify(sentBody && sentBody.messages[0].content));
+      check("D16 提示词里没写 {entries} 也带上了记录", !!sentBody && sentBody.messages[0].content.includes("上午修了水管") && sentBody.messages[0].content.includes("下午买了菜"), JSON.stringify(sentBody && sentBody.messages[0].content));
+      check("D16 回执写清是哪条、几段、写进哪一节",
+        rep.includes("待办") && rep.includes(DAY2 + " 到现在, 2 段") && rep.includes("「AI 待办」"), rep);
+      check("D16 回执带产出正文", rep.includes("- 修水管"), rep);
+      check("D16 产出写进了他自己的节", v3.files[pd.writer.diaryPath(DAY2)].includes("## AI 待办") && v3.files[pd.writer.diaryPath(DAY2)].includes("- 修水管"));
+      check("D16 没有顺手写内置总结节", !v3.files[pd.writer.diaryPath(DAY2)].includes("## AI 总结"), v3.files[pd.writer.diaryPath(DAY2)]);
+      check("D16 触发词本身没被记成日记(段数仍 2)", (await pd.writer.countDay(DAY2)) === 2, String(await pd.writer.countDay(DAY2)));
+      check("D16 记账 prompt-ok", String(pd.data.session.summary_last_result).startsWith("prompt-ok 待办 " + DAY2), pd.data.session.summary_last_result);
+      check("D16 自定义提示词不写 summary_last_date(定时那条路的账)", !pd.data.session.summary_last_date, String(pd.data.session.summary_last_date));
+      check("D16 防手抖状态按节标题分别记", !!pd.data.session.prompts["AI 待办"] && pd.data.session.prompts["AI 待办"].blocks === 2, JSON.stringify(pd.data.session.prompts));
+
+      console.log("  — D16.8 与内置「总结」并存 + 防手抖各算各的");
+      const before = sentBody;
+      const repAgain = await pd.agent._dispatch("待办", false, [], null);
+      check("D16 10 分钟内重复发同一触发词 → 不再调模型", sentBody === before && repAgain.includes("- 修水管"), repAgain);
+      const repSum = await pd.agent._dispatch("总结", false, [], null);
+      check("D16 内置「总结」仍然可用且写到自己那一节",
+        repSum.includes("到现在") && v3.files[pd.writer.diaryPath(DAY2)].includes("## AI 总结") && v3.files[pd.writer.diaryPath(DAY2)].includes("## AI 待办"), repSum);
+      await pd.writer.write("晚上又修了一次", false, DAY2);
+      const repAfterNew = await pd.agent._dispatch("待办", false, [], null);
+      check("D16 有新记录后重算, 且段数变 3", repAfterNew.includes("到现在, 3 段"), repAfterNew);
+
+      console.log("  — D16.9 前置失败与内置优先");
+      const v4 = dv2();
+      const pe = await mkPromptPlugin([{ keyword: "周报", prompt: "p", heading: "AI 周报" }], v4);
+      pe.ai = { ready: () => true, runPrompt: async () => { throw new Error("不该被调用"); } };
+      check("D16 今天没记 → 直说没得做, 不调模型", (await pe.agent._dispatch("周报", false, [], null)) === I.customPromptEmptyReply("周报"));
+      await pe.writer.write("记一条", false, DAY2);
+      pe.settings.aiSummaryEnabled = false;
+      check("D16 主开关没开 → 指路", (await pe.agent._dispatch("周报", false, [], null)) === I.texts3.SUMMARY_OFF_REPLY);
+      pe.settings.aiSummaryEnabled = true;
+      pe.ai = { ready: () => false, runPrompt: async () => { throw new Error("不该被调用"); } };
+      check("D16 AI 没配 → 指路", (await pe.agent._dispatch("周报", false, [], null)) === I.texts3.SUMMARY_NO_KEY_REPLY);
+      // 节标题没填(手改或刚加还没填) → 明确说补一下, 不去猜一个标题乱写
+      pe.settings.aiPrompts = [{ keyword: "周报", prompt: "p", heading: "" }];
+      pe.ai = { ready: () => true, runPrompt: async () => { throw new Error("不该被调用"); } };
+      check("D16 节标题没填 → 让用户去补, 不瞎猜一个节", (await pe.agent._dispatch("周报", false, [], null)).includes("还没设节标题"));
+      // 失败: 回执要用那条自己的名字, 不能串成「总结」。(走真 AiClient: 401 → auth)
+      const v4b = dv2();
+      const pf = await mkPromptPlugin([{ keyword: "周报", prompt: "p", heading: "AI 周报" }], v4b);
+      await pf.writer.write("记一条", false, DAY2);
+      requestUrlImpl = async () => ({ status: 401, text: '{"error":{"message":"invalid api key"}}' });
+      const repFail = await pf.agent._dispatch("周报", false, [], null);
+      check("D16 失败回执用那条自己的名字", repFail.includes("「周报」") && repFail.includes("AI Key 好像不对"), repFail);
+      check("D16 失败不落笔", !(v4b.files[pf.writer.diaryPath(DAY2)] || "").includes("## AI 周报"));
+
+      console.log("  — D16.10 回归: 自定义节先于内置总结节落地时, 记录区不能把它算进去");
+      const v6 = dv2();
+      const pg = await mkPromptPlugin([{ keyword: "待办", prompt: "整理成待办", heading: "AI 待办" }], v6);
+      requestUrlImpl = async () => ({ status: 200, json: { choices: [{ message: { content: "待办X" } }] }, text: "" });
+      await pg.writer.write("第一段", false, DAY2);
+      // 先跑自定义(此时还没有内置总结节) → 文件里的顺序变成 [记录][AI 待办]
+      await pg.agent._dispatch("待办", false, [], null);
+      const gPath = pg.writer.diaryPath(DAY2);
+      check("D16 自定义节先落地, 内置总结节还没有", v6.files[gPath].includes("## AI 待办") && !v6.files[gPath].includes("## AI 总结"));
+      check("D16 此时段数仍是 1(自定义节不算段)", (await pg.writer.countDay(DAY2)) === 1, String(await pg.writer.countDay(DAY2)));
+      // 这一条曾经写进 AI 节里面去: 记录区切分只认内置总结节, 把自定义节当成了记录区
+      const wG = await pg.writer.write("第二段", false, DAY2);
+      check("D16 新记录落在自定义节之前, 不进 AI 节", v6.files[gPath].indexOf("第二段") < v6.files[gPath].indexOf("## AI 待办"), v6.files[gPath]);
+      check("D16 回执说第 2 段(AI 产物没被算成段)", wG.n === 2, String(wG.n));
+      const uG = await pg.writer.undoLastBlock(DAY2);
+      check("D16 撤回撤的是记录, AI 产物还在", uG.ok && uG.removed === "第二段" && v6.files[gPath].includes("待办X"), JSON.stringify(uG));
+      const fzG = await pg.writer.finalizeDay(DAY2);
+      check("D16 封存行落在 AI 节之前, 段数只数记录(1)",
+        fzG.status === "sealed" && fzG.n === 1 && v6.files[gPath].indexOf(I.texts.CLOSING_MARKER) < v6.files[gPath].indexOf("## AI 待办"), JSON.stringify(fzG));
+      check("D16 封存后 AI 产物仍在", v6.files[gPath].includes("待办X"));
+      const srcG = await pg.writer.readSummarySource(DAY2);
+      check("D16 素材只有记录, 没有 AI 产物", srcG.blocks === 1 && srcG.text.includes("第一段") && !srcG.text.includes("待办X"), JSON.stringify(srcG));
+      // 手改 data.json 塞一个撞内置命令的触发词: 内置必须赢(设置页会拦, 这里是纵深防御)
+      const v5 = dv2();
+      const pk = await mkPromptPlugin([{ keyword: "在吗", prompt: "x", heading: "AI 在吗" }], v5);
+      let prioCalls = 0;
+      pk.ai = { ready: () => true, runPrompt: async () => { prioCalls++; return "不该跑"; } };
+      const repPri = await pk.agent._dispatch("在吗", false, [], null);
+      check("D16 触发词撞内置命令(绕过校验手改) → 内置优先, 自定义不跑", prioCalls === 0 && repPri.includes("在的"), repPri);
+      requestUrlImpl = async () => ({});
+    } finally {
+      global.Date = RDate2;
+      I.setDayStartHour(4);
+      requestUrlImpl = async () => ({});
+    }
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

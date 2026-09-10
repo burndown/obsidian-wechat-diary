@@ -77,3 +77,12 @@
 /* #15: 设置页路径格式/附件文件夹输入框下方的实时预览行 */
 .wd-path-preview { margin-top: 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); word-break: break-all; }
 .wd-path-preview-bad { color: var(--text-error); }
+
+/* D16: 设置页「自定义提示词」的每条一个盒子(触发词/提示词/节标题三行归在一起才看得出是一组) */
+.wd-prompt-item {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 2px 12px 10px;
+  margin-bottom: 12px;
+}
+.wd-prompt-item .setting-item { border-top: none; }

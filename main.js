@@ -2387,6 +2387,11 @@ const DEFAULT_SETTINGS = {
   aiSummaryScheduled: false,
   aiSummaryHeading: "AI 总结",     // 写进笔记的二级节标题(与记录节同名时会被兜底换回默认值)
   aiSummaryPushTime: "08:00",      // 微信推送时刻; 在"逻辑日时钟"上比较, 与每日提醒共用一条逻辑
+  // D16 (2026-09-10 谷雨拍板) 自定义提示词: 除了内置的「总结」, 用户还能定义若干条, 每条 =
+  // 触发词 + 提示词 + 自己的节标题。发那个词就跑那条, 各写各的节、互不覆盖。
+  // 内置「总结」保留且不可改不可删(它是每日定时那条路的固定出口); 这一栏是额外的。
+  // 每项: { keyword, prompt, heading }。keyword 不许撞内置命令, heading 不许撞记录节/内置总结节/彼此。
+  aiPrompts: [],
   // 一天的边界(小时): 凌晨 4 点前记的都算前一天(契约 v1.2)。取代 v0.3.0 前的
   // 滚动宽限期(graceMinutes, 已退役)。暂无设置 UI, 要改的用户直接编辑 data.json。
   dayStartHour: 4,
@@ -2771,7 +2776,7 @@ function nightSignoffTip(ctx) {
 
 // ── 意图识别(019 intents.py 移植 + 020「误切换吃内容」修复)──────────────
 
-const INTENT = { DIARY: "DIARY", FINALIZE: "FINALIZE", UNDO: "UNDO", HELP: "HELP", CHAT: "CHAT", START_DIARY: "START_DIARY", SUMMARY: "SUMMARY" };
+const INTENT = { DIARY: "DIARY", FINALIZE: "FINALIZE", UNDO: "UNDO", HELP: "HELP", CHAT: "CHAT", START_DIARY: "START_DIARY", SUMMARY: "SUMMARY", CUSTOM: "CUSTOM" };
 
 const MAX_COMMAND_LEN = 15;
 const FINALIZE_KEYWORDS = new Set([
@@ -3273,17 +3278,21 @@ class AiClient {
     } catch (e) { return null; }
   }
 
-  // D15 每日总结。素材是本地日记文件里的原文, 只有用户显式打开开关且接口配好才会走到这里。
-  // 与 polish 不同: 失败一律抛(调用方按 kind 决定重试还是放弃), 绝不静默降级成"把原文当总结"。
-  // 返回 "" 也算失败(模型输出被消毒层判定不可用)。
-  async summarize(day, weekday, source) {
+  // D15/D16: 用一段提示词跑一次。素材由调用方裁好(只有用户显式打开开关且接口配好才会走到这里)。
+  // 与 polish 不同: 失败一律抛(调用方按 kind 决定重试还是放弃), 绝不静默降级成"把原文当结论"。
+  // 输出被消毒层判空也算失败。
+  async runPrompt(tpl, day, weekday, source) {
     if (!this.ready()) { const e = new Error("no_key"); e.kind = "no_key"; throw e; }
-    const prompt = SUMMARY_PROMPT.split("{day}").join(day)
-      .split("{weekday}").join(weekday || "").split("{entries}").join(source);
-    const out = await this.chatCompletion([{ role: "user", content: prompt }], 0.4, SUMMARY_MODEL_TIMEOUT_MS);
+    const content = renderPromptTemplate(tpl, { day, weekday: weekday || "", entries: source });
+    const out = await this.chatCompletion([{ role: "user", content }], 0.4, SUMMARY_MODEL_TIMEOUT_MS);
     const text = sanitizeSummaryOutput(out);
-    if (!text) { const e = new Error("empty summary"); e.kind = "other"; throw e; }
+    if (!text) { const e = new Error("empty result"); e.kind = "other"; throw e; }
     return text;
+  }
+
+  // 内置「总结」= 内置提示词跑一次。与自定义提示词同一条路, 消毒、超时、错误分类一套共用。
+  async summarize(day, weekday, source) {
+    return this.runPrompt(SUMMARY_PROMPT, day, weekday, source);
   }
 }
 
@@ -4526,13 +4535,33 @@ function splitSummarySection(content, heading) {
   return { rec: text.slice(0, loc.headingStart), summary: text.slice(loc.headingStart) };
 }
 
+// 记录区 = **最早出现的那个 AI 派生节**之前的一切(D16: 派生节不止内置总结一个了)。
+// 只认内置总结节会出事: 自定义节可能先于它被创建(用户先发了自定义触发词), 那时自定义节会落进
+// "记录区"里——段数把它算进去、新记录被追加到它后面、撤回还可能删掉 AI 产物。
+// 返回 { rec, tail }: tail = 全部 AI 派生节(顺序原样), 调用方改完 rec 后原样接回。
+function splitRecordRegion(content, headings) {
+  const text = typeof content === "string" ? content : "";
+  let at = -1;
+  for (const h of headings || []) {
+    if (!h) continue;
+    const loc = locateSection(text, h);
+    if (loc && (at < 0 || loc.headingStart < at)) at = loc.headingStart;
+  }
+  if (at < 0) return { rec: text, tail: "" };
+  return { rec: text.slice(0, at), tail: text.slice(at) };
+}
+
 // 拼回。rec 可能被 removeLastBlock/sealContent 改过尾部的空行, 这里统一成"空行 + 总结节",
 // 保证 ## 标题永远另起一段(贴在上一条记录后面会被 CommonMark 当成正文, 节就废了)。
 // summary 为空时原样返回 rec——没有总结节的文件保持逐字节不变。
-function joinSummarySection(rec, summary) {
-  if (!summary) return rec;
+// 把改过的记录区与 AI 派生节拼回(D16: tail 可能是好几个节, 原样保留、顺序不动)。
+// rec 可能被 removeLastBlock/sealContent 改过尾部空行, 这里统一成"空行 + 派生节",
+// 保证 ## 标题永远另起一段(贴在上一条记录后面会被 CommonMark 当成正文, 节就废了)。
+// tail 为空时原样返回 rec——没有派生节的文件保持逐字节不变。
+function joinSummarySection(rec, tail) {
+  if (!tail) return rec;
   const head = String(rec || "").replace(/\s+$/, "");
-  return (head ? head + "\n\n" : "") + String(summary).replace(/^\n+/, "");
+  return (head ? head + "\n\n" : "") + String(tail).replace(/^\n+/, "");
 }
 
 // 总结是模型生成的, 却和记录区躺在同一个文件里: 形如 `**09:30**` 的整行会被 HEADER_RE_G
@@ -4639,8 +4668,105 @@ const SUMMARY_NO_KEY_REPLY = "想让我总结, 得先把 AI 配好: Obsidian 设
 const SUMMARY_OFF_REPLY = "AI 总结还没打开~ 到 Obsidian 设置 → 第三方插件 → WeChat Diary 里打开「AI 总结」, 再说一声「总结」就行 🔧";
 const SUMMARY_EMPTY_REPLY = "今天还没记东西呢~ 先记点, 再说「总结」📖";
 
-function summaryFailReply(kind) {
-  return "⚠️ " + AI_KIND_TEXT[kind] + ", 这次总结没做出来。你记的内容都好好的在笔记里, 等会儿再说一次「总结」📖";
+function summaryFailReply(kind, cmd) {
+  const c = cmd || "总结";
+  return "⚠️ " + aiErrorText(kind) + ", 这次「" + c + "」没做出来。你记的内容都好好的在笔记里, 等会儿再试一次 📖";
+}
+
+// ── D16 自定义提示词: 触发词匹配 / 提示词模板 / 多节摘除 / 保存前校验 ──────────────
+// 与内置命令共用同一套归一化(intentForms), 所以「待办！」「待办吧」也能命中。
+// **内置命令永远优先**: 这里只在 detectIntent 判定为"内容"之后才被问到, 用户就算把触发词设成内置词
+// 也顶不掉内置功能(保存时另有一道拦截, 提前告诉他为什么不行)。
+
+// 内置命令词的全集: 自定义触发词不许撞。撞了不会崩, 但用户会以为"我明明设了却没反应"。
+function reservedCommandWords() {
+  return new Set([
+    ...FINALIZE_KEYWORDS, ...SIGNOFF_KEYWORDS, ...UNDO_KEYWORDS, ...HELP_KEYWORDS,
+    ...SUMMARY_KEYWORDS, ...CHAT_GREETING_KEYWORDS, ...START_DIARY_KEYWORDS, ...CONTINUE_KEYWORDS,
+  ]);
+}
+
+// 一条自定义提示词该不该被这句话触发。返回命中的条目或 null。
+function matchCustomPrompt(raw, prompts) {
+  const list = Array.isArray(prompts) ? prompts : [];
+  if (!list.length) return null;
+  const { norm, forms } = intentForms(raw);
+  if (!norm) return null;
+  for (const p of list) {
+    if (!p || !p.keyword) continue;
+    if (norm === p.keyword || forms.includes(p.keyword)) return p;
+  }
+  return null;
+}
+
+// 提示词模板: {day} / {weekday} / {entries}。**没写 {entries} 就把素材接在末尾**——
+// 否则用户会写出一个"模型根本看不到记录"的提示词, 而且失败得不响(静默给个瞎编的结果)。
+function renderPromptTemplate(tpl, vars) {
+  const v = vars || {};
+  const entries = String(v.entries == null ? "" : v.entries);
+  let s = String(tpl == null ? "" : tpl);
+  const hadEntries = s.includes("{entries}");
+  s = s.split("{day}").join(v.day == null ? "" : String(v.day))
+       .split("{weekday}").join(v.weekday == null ? "" : String(v.weekday));
+  if (hadEntries) return s.split("{entries}").join(entries);
+  return s.replace(/\s+$/, "") + "\n\n" + entries;
+}
+
+// 摘掉**所有** AI 派生节(内置总结 + 各条自定义), 只留记录区。读素材前必须做:
+// 少摘一条, 跑那一条时就会把别的 AI 产物当成"用户原话"喂回去。
+// 只读用途, 所以不追求字节保真——直接把每个节从标题挖到下一个标题。
+function stripAiSections(content, headings) {
+  let out = String(content == null ? "" : content);
+  for (const h of headings || []) {
+    if (!h) continue;
+    for (;;) {
+      const loc = locateSection(out, h);
+      if (!loc) break;
+      out = out.slice(0, loc.headingStart) + out.slice(loc.bodyEnd);
+    }
+  }
+  return out;
+}
+
+// 触发词校验。返回 { ok, value, error }。existing = 其它条目的触发词, self = 自己当前值。
+function validatePromptKeyword(raw, existing, self) {
+  const text = String(raw == null ? "" : raw);
+  const value = normalizeIntent(text);
+  if (!value) return { ok: false, value: "", error: "触发词不能为空" };
+  if (/[\r\n]/.test(text)) return { ok: false, value: "", error: "触发词不能换行" };
+  if (codePointLen(value) > MAX_COMMAND_LEN) return { ok: false, value: "", error: "触发词最多 " + MAX_COMMAND_LEN + " 个字" };
+  if (reservedCommandWords().has(value) || FORCE_RECORD_RE.test(text.trim())) {
+    return { ok: false, value: "", error: "「" + value + "」是内置命令词, 换一个" };
+  }
+  if ((existing || []).filter((k) => k && k !== self).includes(value)) {
+    return { ok: false, value: "", error: "「" + value + "」已经用过了" };
+  }
+  return { ok: true, value, error: null };
+}
+
+// 节标题校验。撞了记录节或内置总结节 = 节扫描认不出谁是谁, 会当场搞乱记录区, 所以硬拦。
+function validatePromptHeading(raw, opts) {
+  const o = opts || {};
+  const nh = normalizeHeading(raw);
+  if (nh.error) return { ok: false, value: "", error: nh.error };
+  const v = nh.value;
+  if (v === o.sectionHeading) return { ok: false, value: "", error: "不能和记录节的标题「" + o.sectionHeading + "」相同" };
+  if (v === o.summaryHeading) return { ok: false, value: "", error: "不能和内置总结节的标题「" + o.summaryHeading + "」相同" };
+  if ((o.others || []).filter((h) => h && h !== o.self).includes(v)) {
+    return { ok: false, value: "", error: "「" + v + "」已经有别的提示词在用了" };
+  }
+  return { ok: true, value: v, error: null };
+}
+
+// 自定义提示词的回执: 与内置「总结」同形状, 换成那条自己的名字与节标题
+function promptOnDemandReply(name, day, text, blocks, heading) {
+  return "📖 " + name + " (" + day + " 到现在, " + blocks + " 段):\n\n" + String(text || "").trim() +
+    "\n\n(已写进笔记的「" + heading + "」一节)";
+}
+
+// 自定义提示词的三种前置失败: 复用内置那三条, 只把话头换成触发词
+function customPromptEmptyReply(name) {
+  return "今天还没记东西呢~ 先记点, 再说「" + name + "」📖";
 }
 
 class DiaryWriter {
@@ -4975,9 +5101,9 @@ class DiaryWriter {
   // 段数: 共用模式拿到的是节正文, 直接数; 独立模式的外来文件(不是插件建的, #15 B1)只数我们段头之后的块——
   // 否则第一条回执会把用户自己的段落数进"今天第 N 段"(送达确认信号不能虚报)
   _count(text) {
-    // D15: 总结节是派生内容, 不算"今天第 N 段"——数段前先把它摘掉。共用模式下总结节在记录节
-    // 之外, 这一步本来就是 no-op(节正文里根本没有它)。
-    const rec = splitSummarySection(text, this._summaryHeading()).rec;
+    // D15/D16: AI 派生节是派生物, 不算"今天第 N 段"——数段前先把**全部**派生节摘掉
+    // (内置总结 + 各条自定义)。共用模式下它们在记录节之外, 这一步本来就是 no-op。
+    const rec = splitRecordRegion(text, this._aiHeadings()).rec;
     if (!this._shared() && isForeignFile(rec)) {
       const i = rec.search(HEADER_RE_G);
       return i >= 0 ? countMessages(rec.slice(i)) : 0;
@@ -5134,17 +5260,17 @@ class DiaryWriter {
         if (existing) return existing + chunk(existing);
         return "**" + timestamp + "**\n\n" + block + "\n";
       }
-      // 独立模式: existing 是全文。记录区在总结节之前, 新块追在记录区末尾、总结节原样留在最后——
-      // 总结节永远不会被"只追加"的记录写入顶到文件中间去。
-      const sp = splitSummarySection(existing, this._summaryHeading());
-      if (sp.rec) return joinSummarySection(sp.rec + chunk(sp.rec), sp.summary);
+      // 独立模式: existing 是全文。记录区在最靠前的那个 AI 派生节之前, 新块追在记录区末尾、
+      // 派生节原样留在最后——它们永远不会被"只追加"的记录写入顶到文件中间去。
+      const sp = splitRecordRegion(existing, this._aiHeadings());
+      if (sp.rec) return joinSummarySection(sp.rec + chunk(sp.rec), sp.tail);
       const header = "---\n" +
         "date: " + day + "\n" +
         "weekday: " + weekdayForDate(day) + "\n" +
         "source: wechat-diary\n" +
         "---\n\n" +
         "# " + day + "\n";
-      return joinSummarySection(header + "\n\n**" + timestamp + "**\n\n" + block + "\n", sp.summary);
+      return joinSummarySection(header + "\n\n**" + timestamp + "**\n\n" + block + "\n", sp.tail);
     }, { create: true });
   }
 
@@ -5252,8 +5378,8 @@ class DiaryWriter {
         const file = vault.getFileByPath(path);
         if (!file) return { ok: false, removed: null };
         await vault.process(file, (content) => {
-          // D15: 记录区在总结节之前——撤回只该动记录, 不能让 AI 总结被当成"最后一条消息"删掉
-          const sp = splitSummarySection(content, this._summaryHeading());
+          // D15/D16: 记录区在所有 AI 派生节之前——撤回只该动记录, 不能让 AI 产物被当成"最后一条消息"删掉
+          const sp = splitRecordRegion(content, this._aiHeadings());
           // 外来文件护栏(#15 B1): 不是插件建的文件(没有 source: wechat-diary 的 frontmatter)——只有我们段头之后没有块时才拒;
           // 有块时全文最后一个消息块必在段头之后, removeLastBlock 只删它和孤儿段头, 用户段头之前的内容原样保留(与 0.3.1 结果一致)
           if (isForeignFile(sp.rec)) {
@@ -5263,7 +5389,7 @@ class DiaryWriter {
           const res = removeLastBlock(sp.rec);
           if (!res.ok) return content;   // 没东西可撤: 原样返回, 连 mtime 都不惊动
           ok = true; removed = res.removed;
-          return joinSummarySection(res.content, sp.summary);
+          return joinSummarySection(res.content, sp.tail);
         });
       }
     } catch (e) {
@@ -5283,9 +5409,9 @@ class DiaryWriter {
     const vault = this.plugin.app.vault;
     let status = "empty", n = 0, afterSeal = 0;
     const fn = (content) => {
-      // D15: 独立模式下 content 是全文, 封存只该动记录区——封存行落在总结节之前, 总结节原样留在
-      // 文件最后; 共用模式下 content 就是记录节正文, 天然看不到总结节(summary 恒为空)。
-      const sp = this._shared() ? { rec: content, summary: "" } : splitSummarySection(content, this._summaryHeading());
+      // D15/D16: 独立模式下 content 是全文, 封存只该动记录区——封存行落在 AI 派生节之前, 派生节
+      // 原样留在文件最后; 共用模式下 content 就是记录节正文, 天然看不到它们(tail 恒为空)。
+      const sp = this._shared() ? { rec: content, tail: "" } : splitRecordRegion(content, this._aiHeadings());
       const rec = sp.rec;
       // 外来文件(#15 B1, 独立模式): 我们段头之后没有块就不落笔(不往用户的每日笔记里塞封存行), 有块时段数只数段头之后
       if (!this._shared() && isForeignFile(rec)) {
@@ -5294,13 +5420,13 @@ class DiaryWriter {
         if (!own) { status = "empty"; n = 0; afterSeal = 0; return content; }
         const r = sealContent(rec, hhmmStr());
         status = r.status; n = own; afterSeal = r.afterSeal;
-        return r.content === rec ? content : joinSummarySection(r.content, sp.summary);
+        return r.content === rec ? content : joinSummarySection(r.content, sp.tail);
       }
       const r = sealContent(rec, hhmmStr());
       status = r.status; n = r.n; afterSeal = r.afterSeal;
       // 幂等路径(already/empty)下 rec 没被改过: 原样返回全文——join 的边界空行归一化在
-      // "记录区与总结节之间被用户手工插了空行"时会把它们吃掉, 空操作不该动字节
-      return r.content === rec ? content : joinSummarySection(r.content, sp.summary);
+      // "记录区与派生节之间被用户手工插了空行"时会把它们吃掉, 空操作不该动字节
+      return r.content === rec ? content : joinSummarySection(r.content, sp.tail);
     };
     try {
       if (this._shared()) {
@@ -5324,8 +5450,19 @@ class DiaryWriter {
   // 总结节固定放文件末尾、由插件独占。记录区的写入路径在入口处 split 一次、出口 join 回去,
   // 所以"只追加/撤回/封存/计数"这些既有语义完全不需要知道总结节的存在。
 
+  // D16: 所有"AI 派生节"的标题——内置总结 + 各条自定义提示词。读素材时要把它们**全部**摘掉,
+  // 少摘一条就会把别的 AI 产物当成"用户原话"喂回去; 节标题冲突校验也用这份清单。
+  _aiHeadings() {
+    const list = [this._summaryHeading()];
+    for (const p of (this.plugin.settings.aiPrompts || [])) {
+      const h = p && p.heading ? String(p.heading).trim() : "";
+      if (h && !list.includes(h)) list.push(h);
+    }
+    return list;
+  }
+
   // 读一天的微信素材(只读, 永不抛)。返回 { day, text, blocks, chars, truncated }; null = 没有可总结的内容。
-  // 先摘掉已有的总结节: 否则重算时会把上一次的总结当成"用户原话"再喂回去。
+  // 先摘掉**所有**已有的 AI 派生节: 否则重算时会把上一次的产物当成"用户原话"再喂回去。
   async readSummarySource(day) {
     try {
       const vault = this.plugin.app.vault;
@@ -5333,7 +5470,7 @@ class DiaryWriter {
       const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
       if (!file) return null;
       const content = await vault.cachedRead(file);
-      const bare = splitSummarySection(content, this._summaryHeading()).rec;
+      const bare = stripAiSections(content, this._aiHeadings());
       const region = this._shared()
         ? summarySourceRegion(bare, { shared: true, heading: this._heading() })
         : summarySourceRegion(bare, { foreign: isForeignFile(bare) });
@@ -5346,37 +5483,38 @@ class DiaryWriter {
     }
   }
 
-  // 读回已写好的总结正文(推送用)。以笔记为准、不另存一份: 推出去的和笔记里看到的必然一致。
-  async readSummary(day) {
+  // 读回某一节已写好的正文(推送/回执用; 不传 heading = 内置总结节)。以笔记为准、不另存一份。
+  async readSummary(day, heading) {
     try {
       const vault = this.plugin.app.vault;
       const path = this.diaryPath(day);
       const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
       if (!file) return "";
       const content = await vault.cachedRead(file);
-      const loc = locateSection(content, this._summaryHeading());
+      const loc = locateSection(content, heading || this._summaryHeading());
       if (!loc) return "";
-      // 去掉出处那行(> 由 …生成)与它后面的空行, 只把正文推给微信
+      // 去掉出处那行(> 由 …生成)与它后面的空行, 只把正文给微信
       return normalizeNewlines(content.slice(loc.bodyStart, loc.bodyEnd)).trim().replace(/^>[^\n]*\n+/, "").trim();
     } catch (e) { return ""; }
   }
 
-  // 写总结。覆盖式: 这是可再生的派生内容, 重算同一天应当替换而不是再堆一份——它是本插件唯一
-  // 不适用"只追加"承诺的写入, 因此独占文件末尾、与记录区完全隔离。返回 { ok, path }。永不抛。
-  async writeSummary(day, text, meta) {
+  // 写某一节。覆盖式: 这是可再生的派生内容, 重算同一天应当替换而不是再堆一份——它是本插件唯一
+  // 不适用"只追加"承诺的写入, 因此独占文件末尾、与记录区完全隔离。不传 heading = 内置总结节。
+  // 返回 { ok, path }。永不抛。
+  async writeSummary(day, text, meta, heading) {
     const vault = this.plugin.app.vault;
     const path = this.diaryPath(day);
     let ok = false;
     try {
       const file = vault.getFileByPath(path);
       if (!file) return { ok: false, path };
-      const heading = this._summaryHeading();
+      const h = heading || this._summaryHeading();
       const body = buildSummaryBody(text, meta);
       await vault.process(file, (content) => {
         // 不做 normalizeNewlines: 全文里可能有用户自己写的 CRLF, 不属于我们的字节就不动
-        const loc = locateSection(content, heading);
+        const loc = locateSection(content, h);
         ok = true;
-        return loc ? spliceSection(content, loc, body, heading) : appendSection(content, heading, body);
+        return loc ? spliceSection(content, loc, body, h) : appendSection(content, h, body);
       });
     } catch (e) {
       console.error("[wechat-diary] 写总结失败:", e && e.message);
@@ -6061,6 +6199,61 @@ class DiaryAgent {
     return summaryOnDemandReply(day, text, src.blocks, plugin.writer._summaryHeading());
   }
 
+  // D16 自定义提示词: 与「总结」同一套素材(今天到现在)、同一套消毒与防手抖, 差别只在
+  // 提示词与写入的节标题都由用户定。**每条各写自己的节**, 所以互不覆盖、可以同时留在笔记里。
+  async _runCustomPrompt(entry) {
+    const plugin = this.plugin;
+    const name = (entry && entry.keyword) || "自定义";
+    if (!entry || !entry.keyword) return SUMMARY_EMPTY_REPLY;
+    if (!plugin.ai.ready()) return SUMMARY_NO_KEY_REPLY;
+    if (plugin.settings.aiSummaryEnabled !== true) return SUMMARY_OFF_REPLY;
+    const heading = String(entry.heading || "").trim();
+    if (!heading) return "⚠️ 「" + name + "」还没设节标题, 到 Obsidian 设置里补一下再试 📖";
+    const day = logicalTodayStr();
+    const src = await plugin.writer.readSummarySource(day);
+    if (!src) return customPromptEmptyReply(name);
+    const s = plugin.data.session;
+    // 防手抖: 与内置总结同一套, 但每条各记一份(键 = 它自己的节标题)
+    const seen = (s.prompts && s.prompts[heading]) || null;
+    let text = "";
+    if (seen && seen.day === day && seen.blocks === src.blocks &&
+        Date.now() - (seen.ts || 0) < SUMMARY_REPEAT_GUARD_MS) {
+      text = await plugin.writer.readSummary(day, heading);
+    }
+    if (!text) {
+      try {
+        text = await plugin.ai.runPrompt(entry.prompt, day, weekdayForDate(day), src.text);
+      } catch (e) {
+        s.summary_last_result = "prompt-fail " + name + " " + day + " " + ((e && e.kind) || "other") + " " + new Date().toISOString();
+        return summaryFailReply(e && e.kind, name);
+      }
+      const meta = { model: plugin.settings.aiModel, time: todayStr() + " " + hhmmStr(), blocks: src.blocks };
+      const w = await plugin.writer.writeSummary(day, text, meta, heading);
+      if (!w.ok) {
+        // 产出来了但没存下: 内容先给用户, 同时说清笔记里没有——不能让他以为存好了
+        s.summary_last_result = "prompt-writefail " + name + " " + day + " " + new Date().toISOString();
+        return text + "\n\n(⚠️ 这份没能写进笔记, 只有上面对话里有)";
+      }
+      if (!s.prompts) s.prompts = {};
+      s.prompts[heading] = { day, ts: Date.now(), blocks: src.blocks };
+      this._prunePromptState();
+      s.summary_last_result = "prompt-ok " + name + " " + day + " " + new Date().toISOString();
+    }
+    return promptOnDemandReply(name, day, text, src.blocks, heading);
+  }
+
+  // 条目被删/改名之后 session.prompts 里的残键要清掉, 否则它会跟着 data.json 一直长。
+  _prunePromptState() {
+    const s = this.plugin.data.session;
+    const keep = new Set();
+    for (const p of (this.plugin.settings.aiPrompts || [])) {
+      if (p && p.heading) keep.add(String(p.heading).trim());
+    }
+    const next = {};
+    for (const k of Object.keys(s.prompts || {})) if (keep.has(k)) next[k] = s.prompts[k];
+    s.prompts = next;
+  }
+
   // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
   async _handle(text, isVoice, cross, det) {
     det = det || detectIntent(text);
@@ -6073,6 +6266,9 @@ class DiaryAgent {
 
     // 「总结」(D15 补): 按需总结今天到现在——回微信 + 覆盖写笔记的「AI 总结」一节, 不落库
     if (det.intent === INTENT.SUMMARY) return await this._onDemandSummary();
+
+    // 自定义提示词(D16): 与「总结」同一条素材通道, 只是提示词与写入的节由用户定
+    if (det.intent === INTENT.CUSTOM) return await this._runCustomPrompt(det.entry);
 
     if (det.intent === INTENT.UNDO) {
       const r = await this.writer.undoLastBlock();
@@ -6144,7 +6340,12 @@ class DiaryAgent {
     const extrasCount = extras ? ((extras.voices || []).length + (extras.files || []).length + (extras.videos || []).length) : 0;
     const hasMedia = images.length > 0 || extrasCount > 0;
     const wasActive = profile.state === "active"; // 首次见面/取名轮不挂夜间提示(欢迎语已经够长)
-    const det = hasText ? detectIntent(text) : { intent: INTENT.DIARY };
+    let det = hasText ? detectIntent(text) : { intent: INTENT.DIARY };
+    // D16 自定义提示词: 内置命令优先——只有判定成"内容"的短句才去问用户定义的触发词
+    if (hasText && det.intent === INTENT.DIARY) {
+      const hit = matchCustomPrompt(text, this.plugin.settings.aiPrompts);
+      if (hit) det = { intent: INTENT.CUSTOM, entry: hit };
+    }
     this._lastWrite = null; // 本轮有没有写成功、写完是否已封存——夜间收尾提示的依据
     this._pendingNudge = null; // 本轮回执带了夜间提示, 等发送成功后由 commitNudge 落账
     this._pendingVoiceAudio = (extras && extras.voiceAudio) || null; // D12: 本条语音的原声(意图是 DIARY 才会用到)
@@ -7137,6 +7338,83 @@ class WechatDiarySettingTab extends PluginSettingTab {
         b.setDisabled(false);
         new Notice(r.message, 8000);
       }));
+
+    new Setting(containerEl).setName("自定义提示词").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "除了内置的「总结」, 你还能加自己的: 一条 = 触发词 + 提示词 + 写进笔记的节标题。在微信里发那个触发词, 它就把今天到现在的微信记录交给 AI, 按你的提示词产出, 回给你并写进它自己那一节(几条互不覆盖, 可以同时留在笔记里)。提示词里可用 {day} {weekday} {entries} 占位符; 不写 {entries} 的话记录会自动接在提示词后面。内置命令词(撤回/结束/晚安/在吗/帮助/总结…)优先, 不能拿来当触发词。",
+    });
+    const promptListEl = containerEl.createDiv({ cls: "wd-prompt-list" });
+    const renderPromptList = () => {
+      promptListEl.empty();
+      const arr = Array.isArray(plugin.settings.aiPrompts) ? plugin.settings.aiPrompts : [];
+      if (!arr.length) {
+        promptListEl.createEl("p", { cls: "setting-item-description", text: "还没有自定义提示词。点下面的「添加一条」开始。" });
+        return;
+      }
+      arr.forEach((entry, i) => {
+        const box = promptListEl.createDiv({ cls: "wd-prompt-item" });
+        new Setting(box)
+          .setName("第 " + (i + 1) + " 条 · 触发词")
+          .setDesc("在微信里发这个词就跑这一条。")
+          .addText((t) => t.setPlaceholder("待办").setValue(entry.keyword || "")
+            .onChange(async (v) => {
+              const others = (plugin.settings.aiPrompts || []).map((p) => p.keyword);
+              const r = validatePromptKeyword(v, others, entry.keyword);
+              // 打到一半("待")或非法: 不落盘、保持上一个合法值; 只在"用户确实打了东西"时出声
+              if (!r.ok) { if (String(v || "").trim()) new Notice("触发词没保存: " + r.error); return; }
+              entry.keyword = r.value;
+              // 节标题还没填就顺手给个默认, 省得用户忘了填导致跑不起来
+              if (!String(entry.heading || "").trim()) {
+                const hs = (plugin.settings.aiPrompts || []).map((p) => p.heading);
+                const hr = validatePromptHeading("AI " + r.value, {
+                  sectionHeading: plugin.writer._heading(), summaryHeading: plugin.writer._summaryHeading(),
+                  others: hs, self: entry.heading,
+                });
+                if (hr.ok) { entry.heading = hr.value; renderPromptList(); return; }
+              }
+              await plugin.persist();
+            }))
+          .addExtraButton((b) => b.setIcon("trash").setTooltip("删掉这条").onClick(async () => {
+            plugin.settings.aiPrompts.splice(i, 1);
+            await plugin.persist();
+            renderPromptList();
+          }));
+        new Setting(box)
+          .setName("提示词")
+          .setDesc("写给 AI 的指令。")
+          .addTextArea((t) => {
+            t.inputEl.rows = 5;
+            t.setPlaceholder("把下面这些记录整理成待办清单, 每条一行, 只留还没做完的事。\n\n{entries}")
+              .setValue(entry.prompt || "")
+              .onChange(async (v) => { entry.prompt = v; await plugin.persist(); });
+          });
+        new Setting(box)
+          .setName("写进笔记的节标题")
+          .setDesc("默认按触发词取名。不能和「" + plugin.writer._heading() + "」「" + plugin.writer._summaryHeading() + "」或别的自定义节重名。")
+          .addText((t) => t.setPlaceholder("AI 待办").setValue(entry.heading || "")
+            .onChange(async (v) => {
+              const others = (plugin.settings.aiPrompts || []).map((p) => p.heading);
+              const r = validatePromptHeading(v, {
+                sectionHeading: plugin.writer._heading(), summaryHeading: plugin.writer._summaryHeading(),
+                others, self: entry.heading,
+              });
+              if (!r.ok) { if (String(v || "").trim()) new Notice("节标题没保存: " + r.error); return; }
+              entry.heading = r.value;
+              await plugin.persist();
+            }));
+      });
+    };
+    renderPromptList();
+    new Setting(containerEl)
+      .setName("加一条")
+      .setDesc("加完把三项都填上; 触发词和节标题重名会被拦下。")
+      .addButton((b) => b.setButtonText("添加一条").onClick(async () => {
+        if (!Array.isArray(plugin.settings.aiPrompts)) plugin.settings.aiPrompts = [];
+        plugin.settings.aiPrompts.push({ keyword: "", prompt: "", heading: "" });
+        await plugin.persist();
+        renderPromptList();
+      }));
   }
 }
 
@@ -7172,6 +7450,9 @@ const DEFAULT_DATA = () => ({
     // (素材段数没变就复用笔记里那份, 不再烧一次 token)。刻意与 summary_last_date 分开记:
     // 那是定时那条路的账, 按需总结若去动它, 当天边界的定时总结会误判成"已处理过"而跳过。
     onsummary_day: "", onsummary_ts: 0, onsummary_blocks: 0,
+    // D16 自定义提示词: 同一套防手抖, 但每条各记一份(键 = 该条的节标题)。条目被删/改名后
+    // 的残键由 _prunePromptState 清掉, 不让它无限长。
+    prompts: {},
   },
 });
 
@@ -7991,6 +8272,10 @@ WechatDiaryPlugin.__internals = {
   SUMMARY_KEYWORDS, summaryOnDemandReply, summaryFailReply,
   texts3: { SUMMARY_NO_KEY_REPLY, SUMMARY_OFF_REPLY, SUMMARY_EMPTY_REPLY },
   AI_KIND_TEXT, aiErrorText, shortBody,
+  // D16 自定义提示词
+  matchCustomPrompt, renderPromptTemplate, stripAiSections, reservedCommandWords,
+  validatePromptKeyword, validatePromptHeading, promptOnDemandReply, customPromptEmptyReply,
+  splitRecordRegion,
   // #15 路径层与共用文件模式
   renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
   normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,
