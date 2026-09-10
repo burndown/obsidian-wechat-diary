@@ -2377,6 +2377,12 @@ const DEFAULT_SETTINGS = {
   timezone: "Asia/Shanghai",
   aiApiUrl: "",
   aiModel: "",
+  // D15 (2026-09-10 谷雨拍板) AI 每日总结: 逻辑日边界后总结刚结束的那天, 写进当天笔记 + 早上推微信。
+  // 默认关: 把笔记内容发给第三方接口必须是用户显式打开的开关, 与"零 key 也完整可用"的默认姿态一致
+  // (D2 提过的那条代价: 回顾能力需要有 key, 零 key 时降级成"什么都没有", 所以它不能默认改变谁的行为)。
+  aiSummaryEnabled: false,
+  aiSummaryHeading: "AI 总结",     // 写进笔记的二级节标题(与记录节同名时会被兜底换回默认值)
+  aiSummaryPushTime: "08:00",      // 微信推送时刻; 在"逻辑日时钟"上比较, 与每日提醒共用一条逻辑
   // 一天的边界(小时): 凌晨 4 点前记的都算前一天(契约 v1.2)。取代 v0.3.0 前的
   // 滚动宽限期(graceMinutes, 已退役)。暂无设置 UI, 要改的用户直接编辑 data.json。
   dayStartHour: 4,
@@ -2554,23 +2560,67 @@ function reminderText(idx) {
   const n = REMINDER_LINES.length;
   return REMINDER_LINES[((idx % n) + n) % n];
 }
-// 该不该发提醒(纯函数, 表驱动可测)。规则一句话: 到点了、今天(逻辑日)还什么都没记、
-// 今天没提醒过、连续没写不满 3 天 → 发。时间比较在"逻辑日时钟"上做(21:30 的窗口一直开到凌晨 4 点)。
-function reminderDue(ctx) {
-  if (!ctx || !ctx.enabled) return false;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(String(ctx.timeStr || "").trim());
+// 逻辑日时钟: 把"几点几分"落到以 dayStartHour 为 0 点的一天里——21:30 的窗口一直开到凌晨 4 点。
+// 提醒与 AI 总结推送共用这一条: 同一套时间语义写两遍必然漂移(审稿轮抓过同类问题)。
+function logicalTimeReached(timeStr, now) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
   if (!m) return false;
   const rh = Number(m[1]), rm = Number(m[2]);
   if (rh > 23 || rm > 59) return false; // 设置页同规则拦截(REMINDER_TIME_RE), 这里是纵深防御
-  const [hh, mm] = hhmmStr(ctx.now).split(":").map(Number);
+  const [hh, mm] = hhmmStr(now).split(":").map(Number);
   const dayStart = _dayStartHour * 60;
   const nowLogical = (hh * 60 + mm - dayStart + 1440) % 1440;
-  const remLogical = (rh * 60 + rm - dayStart + 1440) % 1440;
-  if (nowLogical < remLogical) return false;
+  const wantLogical = (rh * 60 + rm - dayStart + 1440) % 1440;
+  return nowLogical >= wantLogical;
+}
+
+// 该不该发提醒(纯函数, 表驱动可测)。规则一句话: 到点了、今天(逻辑日)还什么都没记、
+// 今天没提醒过、连续没写不满 3 天 → 发。
+function reminderDue(ctx) {
+  if (!ctx || !ctx.enabled) return false;
+  if (!logicalTimeReached(ctx.timeStr, ctx.now)) return false;
   if ((ctx.countToday || 0) > 0) return false;
   if (ctx.remindedDate && ctx.remindedDate === logicalTodayStr(ctx.now)) return false;
   if ((ctx.streak || 0) >= REMINDER_STREAK_MAX) return false;
   return true;
+}
+
+// ── AI 每日总结(D15, 2026-09-10 谷雨拍板)─────────────────────────────────
+// 逻辑日边界(默认凌晨 4 点)过后, 把刚结束那天的微信记录交给 AI 总结, 写回当天笔记的
+// 「## AI 总结」一节; 早上(默认 08:00)再推一次微信——生成在边界、推送在早上, 免得凌晨震手机。
+// 默认关: 把笔记内容发给第三方接口必须是用户显式打开的开关, 与"零 key 也完整可用"的默认姿态一致。
+const SUMMARY_MAX_ATTEMPTS = 3;          // 生成失败重试上限(每次 tick 试一次), 超了放弃并记账
+const SUMMARY_PUSH_MAX_ATTEMPTS = 3;     // 推送失败重试上限, 超了改成"下次对话带出"
+const SUMMARY_MAX_INPUT_CHARS = 12000;   // 单日素材上限: 超出截断并注明(一天都塞不进上下文, 硬撑只会烧 token)
+const SUMMARY_MAX_OUTPUT_CHARS = 1500;   // 模型跑飞(开始复述原文)时的闸门
+const SUMMARY_PUSH_MAX_CHARS = 900;      // 微信推文上限, 超了截断并指向笔记
+const SUMMARY_MODEL_TIMEOUT_MS = 90000;  // 长文总结比润色慢, 给足; 桌面端 requestUrl 没有应用层超时
+const SUMMARY_DEFAULT_HEADING = "AI 总结";
+
+// 该不该生成当天的总结(纯函数, 表驱动可测)。规则: 开关开着 + AI 配好了 + 逻辑日已翻篇
+// (刚结束那天的记录才攒齐) + 这天没处理过 + 确实读到素材 + 没超重试上限。
+function summaryDue(ctx) {
+  if (!ctx || !ctx.enabled || !ctx.aiReady) return false;
+  if (!ctx.boundaryPassed) return false;
+  if (!ctx.prevDay) return false;
+  if (ctx.lastDate && ctx.prevDay <= ctx.lastDate) return false;
+  if (ctx.hasContent === false) return false;
+  if ((ctx.attempts || 0) >= SUMMARY_MAX_ATTEMPTS) return false;
+  return true;
+}
+
+// 逻辑日是否已翻篇: 此刻的"今天"已经是日历上的今天, 说明刚跨过 dayStartHour 边界。
+// 边界之前(比如凌晨 2 点)逻辑日还没结束, 这时候总结会把写了一半的一天封掉。
+// dayStartHour=0 时恒为真(契约允许把一天设成从 0 点切)。
+function logicalDayFlipped(now) {
+  return logicalTodayStr(now) === todayStr(now);
+}
+
+// 该不该推微信(纯函数): 有生成好的总结、开关还开着、到了推送时刻、没超过重试上限。
+function summaryPushDue(ctx) {
+  if (!ctx || !ctx.enabled || !ctx.pendingDay) return false;
+  if ((ctx.attempts || 0) >= SUMMARY_PUSH_MAX_ATTEMPTS) return false;
+  return logicalTimeReached(ctx.timeStr, ctx.now);
 }
 
 // 收尾语分时段(2026-08-16 谷雨审定): 备忘录用户中午也会「结束」, 白天说"晚安"违和。
@@ -3079,6 +3129,20 @@ const NAME_LLM_PROMPT = `用户被问「你希望我叫你什么名字」, 用�
 从回答中提取用户希望被称呼的名字, 只输出名字本身 (不超过 10 个字), 不要任何解释。
 如果回答里没有名字、或用户表示不想要称呼, 只输出一个字: 无`;
 
+// D15 每日总结。写得像"替用户看了一眼今天", 不是文学创作: 保留细节、不编、不给建议清单。
+// 明确禁止标题行——节标题由插件写, 模型多写一个会抢节的边界(消毒层另有一道兜底)。
+const SUMMARY_PROMPT = `用户在 {day} ({weekday}) 通过微信随手记发来的全部原话如下(可能含语音转写, 带 🎤 的是语音):
+{entries}
+
+请写一份当天的总结。要求:
+- 中文, 直接对用户说话, 语气自然平实, 不煽情、不喊口号
+- 开头一句话抓住这一天的主线
+- 然后列 2-5 条要点, 每条一行, 以 "- " 开头; 保留具体的人名、地名、数字、时间、物品这些细节, 不要泛化
+- 如果记录里透出情绪、反复出现的话题、或明显没做完的事, 用一小段点出来; 没有就不写
+- 只依据上面的原话, 不要补充原话里没有的信息, 不要推测用户没说的意图
+- 不要给建议清单, 不要写"希望对你有帮助"这类客套
+- 直接输出正文: 不要标题行(# 开头)、不要代码块、不要"以下是总结"这类开场白`;
+
 // 【宿主适配】auth 一条: .env 概念改为插件设置
 const NET_NOTE_BY_KIND = {
   auth: " (AI Key 好像不对呢, 检查下插件设置, 原文已存)",
@@ -3155,6 +3219,19 @@ class AiClient {
       if (!out || out === "无" || out.toLowerCase() === "none") return null;
       return validateName(out);
     } catch (e) { return null; }
+  }
+
+  // D15 每日总结。素材是本地日记文件里的原文, 只有用户显式打开开关且接口配好才会走到这里。
+  // 与 polish 不同: 失败一律抛(调用方按 kind 决定重试还是放弃), 绝不静默降级成"把原文当总结"。
+  // 返回 "" 也算失败(模型输出被消毒层判定不可用)。
+  async summarize(day, weekday, source) {
+    if (!this.ready()) { const e = new Error("no_key"); e.kind = "no_key"; throw e; }
+    const prompt = SUMMARY_PROMPT.split("{day}").join(day)
+      .split("{weekday}").join(weekday || "").split("{entries}").join(source);
+    const out = await this.chatCompletion([{ role: "user", content: prompt }], 0.4, SUMMARY_MODEL_TIMEOUT_MS);
+    const text = sanitizeSummaryOutput(out);
+    if (!text) { const e = new Error("empty summary"); e.kind = "other"; throw e; }
+    return text;
   }
 }
 
@@ -4384,6 +4461,119 @@ function sealContent(content, hhmm) {
   return { status: "sealed", n, afterSeal: 0, content: content + "\n\n---\n" + CLOSING_MARKER + " " + hhmm + ")_\n" };
 }
 
+// ── AI 总结: 素材抽取 / 输出消毒 / 拼节(纯函数, bindtest 走 __internals)──────────
+// 布局约定: 总结节固定放在**文件末尾**, 由插件独占(覆盖式重写); 它前面的一切都是"记录区",
+// 记录区的既有语义(只追加/撤回/封存/计数)一字不改, 只在入口处把两者拆开再拼回。
+// 这样"历史段落永不改写"这条契约不会被派生内容破坏——记录区的实现根本看不见总结节。
+
+// 拆出 { rec: 记录区, summary: 总结节原文(含标题行) }。没有总结节时 summary="" 且 rec 逐字节等于原文。
+function splitSummarySection(content, heading) {
+  const text = typeof content === "string" ? content : "";
+  const loc = locateSection(text, heading);
+  if (!loc) return { rec: text, summary: "" };
+  return { rec: text.slice(0, loc.headingStart), summary: text.slice(loc.headingStart) };
+}
+
+// 拼回。rec 可能被 removeLastBlock/sealContent 改过尾部的空行, 这里统一成"空行 + 总结节",
+// 保证 ## 标题永远另起一段(贴在上一条记录后面会被 CommonMark 当成正文, 节就废了)。
+// summary 为空时原样返回 rec——没有总结节的文件保持逐字节不变。
+function joinSummarySection(rec, summary) {
+  if (!summary) return rec;
+  const head = String(rec || "").replace(/\s+$/, "");
+  return (head ? head + "\n\n" : "") + String(summary).replace(/^\n+/, "");
+}
+
+// 总结是模型生成的, 却和记录区躺在同一个文件里: 形如 `**09:30**` 的整行会被 HEADER_RE_G
+// 当成段头(段头/同一分钟合并/撤回/封存全依赖它), 一律转义。与 escapeHeadingLines 同理。
+function escapeSummaryHeaderLines(text) {
+  return String(text).replace(/^([ \t]*)\*\*(\d{1,2}:\d{2})\*\*([ \t]*)$/gm, "$1\\*\\*$2\\*\\*$3");
+}
+
+// 圈出"只属于微信随手记"的那段素材, 用户自己在每日笔记里写的内容不进去。
+// 共用模式 = 节正文; 独立模式 = 去掉 frontmatter 与标题; 独立模式的外来文件(#15 B1:
+// 用户自己的笔记恰好落在日记路径)= 只取第一个段头之后, 段头之前是他的东西。
+function summarySourceRegion(content, opts) {
+  const o = opts || {};
+  const text = normalizeNewlines(typeof content === "string" ? content : "");
+  if (o.shared) {
+    const loc = locateSection(text, o.heading);
+    return loc ? text.slice(loc.bodyStart, loc.bodyEnd) : "";
+  }
+  const body = text.slice(frontmatterEnd(text));
+  if (o.foreign) {
+    const i = body.search(HEADER_RE_G);
+    return i >= 0 ? body.slice(i) : "";
+  }
+  return body;
+}
+
+// 素材清洗: 段头/标题/封存行/纯附件嵌入行去掉(LLM 看这些没意义还占 token), 语音的 🎤 标记留着
+// (它是"说的"不是"写的", 总结时值得区分)。返回 { text, blocks, chars, truncated };
+// blocks=0 = 这天没有可总结的内容(不落笔、不调用 AI)。
+// 注意真消息不会被误伤: 契约已把行首的 `# `/`---`/`_(` 转义过(normalizeDiaryBlockText /
+// escapeHeadingLines), 所以这里匹配到的只可能是插件自己写的结构行。
+function cleanSummarySource(region, maxChars) {
+  const keep = [];
+  for (const raw of String(region || "").split("\n\n")) {
+    const block = raw.trim();
+    if (!block) continue;
+    if (HEADER_FULL_RE.test(block)) continue;      // 段头
+    if (/^#{1,6}\s/.test(block)) continue;          // 标题行(# 日期 / 用户加的小标题): 是结构不是内容
+    const text = block.split("\n").filter((ln) => {
+      const t = ln.trim();
+      if (!t) return false;
+      if (t === "---") return false;                     // 封存线的分隔
+      if (t.startsWith("_(")) return false;              // 封存行
+      return !/^!\[\[.*\]\]$/.test(t);                    // 纯附件嵌入(图片/文件/语音条)
+    }).map((ln) => ln.replace(/[ \t\r]+$/, "")).join("\n").trim();
+    if (!text) continue;
+    keep.push(text);
+  }
+  let text = keep.join("\n\n");
+  const limit = Number(maxChars) > 0 ? Number(maxChars) : SUMMARY_MAX_INPUT_CHARS;
+  let truncated = false;
+  if (text.length > limit) { text = text.slice(0, limit) + "\n\n(素材过长, 已截断)"; truncated = true; }
+  return { text, blocks: keep.length, chars: text.length, truncated };
+}
+
+// 模型输出的消毒。返回 "" = 这次输出不可用, 调用方按失败重试, 绝不把垃圾落盘。
+function sanitizeSummaryOutput(raw) {
+  let s = String(raw || "").replace(/\r\n?/g, "\n").trim();
+  if (!s) return "";
+  s = s.replace(/^```[a-zA-Z]*[ \t]*\n/, "").replace(/\n```$/, "").trim();   // 整体包在代码围栏里
+  const lines = s.split("\n");
+  // 模型爱加的「# 今日总结」这类标题: 整行删掉——节标题由插件写, 多一个会抢节的边界
+  const isTitle = (ln) => /^#{1,6}[ \t]*(今日)?(总结|回顾|摘要)[ \t]*$/.test(String(ln).trim());
+  const isPreamble = (ln) => /^以下是.{0,20}(总结|回顾|摘要).{0,3}[:：]?$/.test(String(ln).trim());
+  while (lines.length && (isTitle(lines[0]) || isPreamble(lines[0]))) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  s = lines.join("\n").trim();
+  if (s.length >= 2 && /^["“「]/.test(s) && /["”」]$/.test(s)) s = s.slice(1, -1).trim();   // 整段被引号包起来
+  if (!s) return "";
+  if (s.length > SUMMARY_MAX_OUTPUT_CHARS) s = s.slice(0, SUMMARY_MAX_OUTPUT_CHARS).replace(/\s+$/, "") + "\n\n(总结过长, 已截断)";
+  // 转义必须最后做: 先说清正文, 再让它无法伪装成记录区里的段头/标题/围栏
+  return escapeSummaryHeaderLines(escapeFenceLines(escapeHeadingLines(s))).trim();
+}
+
+// 总结节的正文(标题行由 appendSection/spliceSection 写)。首行是一句出处:
+// 日后翻回来能一眼看出这段是 AI 写的、哪个模型、哪一天、几段素材。
+function buildSummaryBody(text, meta) {
+  const m = meta || {};
+  const src = "> " + [m.model ? "由 " + m.model + " 生成" : "AI 生成", m.time || "",
+    m.blocks ? m.blocks + " 段素材" : "", "仅供参考"].filter(Boolean).join(" · ");
+  return src + "\n\n" + String(text || "").trim() + "\n";
+}
+
+// 推到微信的文案: 先说清是哪天、全文在哪, 再给正文; 超长截断, 不硬塞 4000 字给手机。
+function summaryPushText(day, weekday, text, heading) {
+  const body = String(text || "").trim();
+  const cut = body.length > SUMMARY_PUSH_MAX_CHARS
+    ? body.slice(0, SUMMARY_PUSH_MAX_CHARS).replace(/\s+$/, "") + "…"
+    : body;
+  return "🌙 " + day + (weekday ? " (" + weekday + ")" : "") + " 的随手记总结:\n\n" + cut +
+    "\n\n(全文在 " + day + " 笔记的「" + (heading || SUMMARY_DEFAULT_HEADING) + "」一节)";
+}
+
 class DiaryWriter {
   constructor(plugin, ai) { this.plugin = plugin; this.ai = ai; }
 
@@ -4396,6 +4586,12 @@ class DiaryWriter {
   _join(root, rel) { return normalizePath(root ? root + "/" + rel : rel); }
   _shared() { return !!this.plugin.settings.sharedDailyNote; }
   _heading() { return String(this.plugin.settings.sectionHeading || DEFAULT_SETTINGS.sectionHeading).trim() || DEFAULT_SETTINGS.sectionHeading; }
+  // D15 总结节标题。与记录节同名会当场毁掉记录区(节扫描认不出谁是谁), 兜底换回默认值——
+  // 设置页也拦, 这里是纵深防御(用户可以手改 data.json)。
+  _summaryHeading() {
+    const h = String(this.plugin.settings.aiSummaryHeading || SUMMARY_DEFAULT_HEADING).trim() || SUMMARY_DEFAULT_HEADING;
+    return h === this._heading() ? SUMMARY_DEFAULT_HEADING : h;
+  }
 
   diaryPath(dateStr) {
     return this._join(this._root(), renderPath(this._fmt(), dateStr, moment) + ".md");
@@ -4710,11 +4906,14 @@ class DiaryWriter {
   // 段数: 共用模式拿到的是节正文, 直接数; 独立模式的外来文件(不是插件建的, #15 B1)只数我们段头之后的块——
   // 否则第一条回执会把用户自己的段落数进"今天第 N 段"(送达确认信号不能虚报)
   _count(text) {
-    if (!this._shared() && isForeignFile(text)) {
-      const i = text.search(HEADER_RE_G);
-      return i >= 0 ? countMessages(text.slice(i)) : 0;
+    // D15: 总结节是派生内容, 不算"今天第 N 段"——数段前先把它摘掉。共用模式下总结节在记录节
+    // 之外, 这一步本来就是 no-op(节正文里根本没有它)。
+    const rec = splitSummarySection(text, this._summaryHeading()).rec;
+    if (!this._shared() && isForeignFile(rec)) {
+      const i = rec.search(HEADER_RE_G);
+      return i >= 0 ? countMessages(rec.slice(i)) : 0;
     }
-    return countMessages(text);
+    return countMessages(rec);
   }
 
   // ── 共用文件模式(#15/D13): 插件只认、只动当天每日笔记里「## <标题>」一节 ─────────
@@ -4858,20 +5057,25 @@ class DiaryWriter {
   }
   _appendRaw(day, timestamp, block) {
     return this._editDay(day, (existing) => {
-      if (existing) {
-        const chunk = canMergeIntoLastHeader(existing, timestamp)
-          ? "\n" + block + "\n"
-          : "\n\n**" + timestamp + "**\n\n" + block + "\n";
-        return existing + chunk;
+      const chunk = (rec) => canMergeIntoLastHeader(rec, timestamp)
+        ? "\n" + block + "\n"
+        : "\n\n**" + timestamp + "**\n\n" + block + "\n";
+      if (this._shared()) {
+        // 共用模式: existing 就是记录节正文, 总结节在节外, 这里根本看不到它
+        if (existing) return existing + chunk(existing);
+        return "**" + timestamp + "**\n\n" + block + "\n";
       }
-      if (this._shared()) return "**" + timestamp + "**\n\n" + block + "\n";
+      // 独立模式: existing 是全文。记录区在总结节之前, 新块追在记录区末尾、总结节原样留在最后——
+      // 总结节永远不会被"只追加"的记录写入顶到文件中间去。
+      const sp = splitSummarySection(existing, this._summaryHeading());
+      if (sp.rec) return joinSummarySection(sp.rec + chunk(sp.rec), sp.summary);
       const header = "---\n" +
         "date: " + day + "\n" +
         "weekday: " + weekdayForDate(day) + "\n" +
         "source: wechat-diary\n" +
         "---\n\n" +
         "# " + day + "\n";
-      return header + "\n\n**" + timestamp + "**\n\n" + block + "\n";
+      return joinSummarySection(header + "\n\n**" + timestamp + "**\n\n" + block + "\n", sp.summary);
     }, { create: true });
   }
 
@@ -4979,15 +5183,18 @@ class DiaryWriter {
         const file = vault.getFileByPath(path);
         if (!file) return { ok: false, removed: null };
         await vault.process(file, (content) => {
+          // D15: 记录区在总结节之前——撤回只该动记录, 不能让 AI 总结被当成"最后一条消息"删掉
+          const sp = splitSummarySection(content, this._summaryHeading());
           // 外来文件护栏(#15 B1): 不是插件建的文件(没有 source: wechat-diary 的 frontmatter)——只有我们段头之后没有块时才拒;
           // 有块时全文最后一个消息块必在段头之后, removeLastBlock 只删它和孤儿段头, 用户段头之前的内容原样保留(与 0.3.1 结果一致)
-          if (isForeignFile(content)) {
-            const i = content.search(HEADER_RE_G);
-            if (i < 0 || !countMessages(content.slice(i))) { foreign = true; return content; }
+          if (isForeignFile(sp.rec)) {
+            const i = sp.rec.search(HEADER_RE_G);
+            if (i < 0 || !countMessages(sp.rec.slice(i))) { foreign = true; return content; }
           }
-          const res = removeLastBlock(content);
-          if (res.ok) { ok = true; removed = res.removed; }
-          return res.content;
+          const res = removeLastBlock(sp.rec);
+          if (!res.ok) return content;   // 没东西可撤: 原样返回, 连 mtime 都不惊动
+          ok = true; removed = res.removed;
+          return joinSummarySection(res.content, sp.summary);
         });
       }
     } catch (e) {
@@ -5007,18 +5214,24 @@ class DiaryWriter {
     const vault = this.plugin.app.vault;
     let status = "empty", n = 0, afterSeal = 0;
     const fn = (content) => {
+      // D15: 独立模式下 content 是全文, 封存只该动记录区——封存行落在总结节之前, 总结节原样留在
+      // 文件最后; 共用模式下 content 就是记录节正文, 天然看不到总结节(summary 恒为空)。
+      const sp = this._shared() ? { rec: content, summary: "" } : splitSummarySection(content, this._summaryHeading());
+      const rec = sp.rec;
       // 外来文件(#15 B1, 独立模式): 我们段头之后没有块就不落笔(不往用户的每日笔记里塞封存行), 有块时段数只数段头之后
-      if (!this._shared() && isForeignFile(content)) {
-        const i = content.search(HEADER_RE_G);
-        const own = i >= 0 ? countMessages(content.slice(i)) : 0;
+      if (!this._shared() && isForeignFile(rec)) {
+        const i = rec.search(HEADER_RE_G);
+        const own = i >= 0 ? countMessages(rec.slice(i)) : 0;
         if (!own) { status = "empty"; n = 0; afterSeal = 0; return content; }
-        const r = sealContent(content, hhmmStr());
+        const r = sealContent(rec, hhmmStr());
         status = r.status; n = own; afterSeal = r.afterSeal;
-        return r.content;
+        return r.content === rec ? content : joinSummarySection(r.content, sp.summary);
       }
-      const r = sealContent(content, hhmmStr());
+      const r = sealContent(rec, hhmmStr());
       status = r.status; n = r.n; afterSeal = r.afterSeal;
-      return r.content;
+      // 幂等路径(already/empty)下 rec 没被改过: 原样返回全文——join 的边界空行归一化在
+      // "记录区与总结节之间被用户手工插了空行"时会把它们吃掉, 空操作不该动字节
+      return r.content === rec ? content : joinSummarySection(r.content, sp.summary);
     };
     try {
       if (this._shared()) {
@@ -5036,6 +5249,71 @@ class DiaryWriter {
     }
     if (status === "sealed" && this._shared()) { const pc = this._pendingFor(day); if (pc) pc.sealed = true; }
     return { status, n, afterSeal };
+  }
+
+  // ── D15: AI 总结的读写 ──────────────────────────────────────────────────
+  // 总结节固定放文件末尾、由插件独占。记录区的写入路径在入口处 split 一次、出口 join 回去,
+  // 所以"只追加/撤回/封存/计数"这些既有语义完全不需要知道总结节的存在。
+
+  // 读一天的微信素材(只读, 永不抛)。返回 { day, text, blocks, chars, truncated }; null = 没有可总结的内容。
+  // 先摘掉已有的总结节: 否则重算时会把上一次的总结当成"用户原话"再喂回去。
+  async readSummarySource(day) {
+    try {
+      const vault = this.plugin.app.vault;
+      const path = this.diaryPath(day);
+      const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
+      if (!file) return null;
+      const content = await vault.cachedRead(file);
+      const bare = splitSummarySection(content, this._summaryHeading()).rec;
+      const region = this._shared()
+        ? summarySourceRegion(bare, { shared: true, heading: this._heading() })
+        : summarySourceRegion(bare, { foreign: isForeignFile(bare) });
+      const cleaned = cleanSummarySource(region, SUMMARY_MAX_INPUT_CHARS);
+      if (!cleaned.blocks) return null;
+      return Object.assign({ day }, cleaned);
+    } catch (e) {
+      console.error("[wechat-diary] 读总结素材失败:", e && e.message);
+      return null;
+    }
+  }
+
+  // 读回已写好的总结正文(推送用)。以笔记为准、不另存一份: 推出去的和笔记里看到的必然一致。
+  async readSummary(day) {
+    try {
+      const vault = this.plugin.app.vault;
+      const path = this.diaryPath(day);
+      const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
+      if (!file) return "";
+      const content = await vault.cachedRead(file);
+      const loc = locateSection(content, this._summaryHeading());
+      if (!loc) return "";
+      // 去掉出处那行(> 由 …生成)与它后面的空行, 只把正文推给微信
+      return normalizeNewlines(content.slice(loc.bodyStart, loc.bodyEnd)).trim().replace(/^>[^\n]*\n+/, "").trim();
+    } catch (e) { return ""; }
+  }
+
+  // 写总结。覆盖式: 这是可再生的派生内容, 重算同一天应当替换而不是再堆一份——它是本插件唯一
+  // 不适用"只追加"承诺的写入, 因此独占文件末尾、与记录区完全隔离。返回 { ok, path }。永不抛。
+  async writeSummary(day, text, meta) {
+    const vault = this.plugin.app.vault;
+    const path = this.diaryPath(day);
+    let ok = false;
+    try {
+      const file = vault.getFileByPath(path);
+      if (!file) return { ok: false, path };
+      const heading = this._summaryHeading();
+      const body = buildSummaryBody(text, meta);
+      await vault.process(file, (content) => {
+        // 不做 normalizeNewlines: 全文里可能有用户自己写的 CRLF, 不属于我们的字节就不动
+        const loc = locateSection(content, heading);
+        ok = true;
+        return loc ? spliceSection(content, loc, body, heading) : appendSection(content, heading, body);
+      });
+    } catch (e) {
+      console.error("[wechat-diary] 写总结失败:", e && e.message);
+      return { ok: false, path };
+    }
+    return { ok, path };
   }
 }
 
@@ -5822,6 +6100,10 @@ class DiaryAgent {
     // 陌生人静默丢弃(_handleIncoming 已挡, 这里兜底): 回复等于向未授权者确认 bot 存活
     if (fromUserId !== this.plugin.data.ilink.userId) return null;
     let reply = await this._dispatch(text, isVoice, images || [], extras || null);
+    // D15: 主动推送没送出去的总结, 借这次对话带出来(用户开口就是最可靠的送达时机)。
+    // 放在离线补记告知之前, 让"今天记了几段"这类收尾信息留在最后。
+    const pendingSummary = await this.plugin._takePendingSummaryDelivery();
+    if (pendingSummary) reply = reply ? reply + "\n\n" + pendingSummary : pendingSummary;
     if (reply && this.offlineNotice) {
       reply = reply + "\n\n" + this.offlineNotice;
       this.offlineNotice = null;
@@ -6645,10 +6927,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(containerEl).setName("AI (暂未启用)").setHeading();
+    new Setting(containerEl).setName("AI 每日总结").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
-      text: "当前版本走纯机械记录, 不调用任何 AI——发什么原文存什么。这里的配置会保留, 将来 AI 功能回归时生效。",
+      text: "默认关闭。打开后, 每天跨过「一天的边界」(默认凌晨 4 点)时, 插件把刚结束那天的微信记录交给下面的接口, 总结写进当天笔记的「AI 总结」一节, 到点(默认 08:00)再推一次微信。只有你发给 bot 的内容会被发送, 用户自己在每日笔记里写的东西不会外发。",
     });
 
     new Setting(containerEl)
@@ -6672,6 +6954,72 @@ class WechatDiarySettingTab extends PluginSettingTab {
       .addText((t) => t.setPlaceholder("deepseek-chat")
         .setValue(plugin.settings.aiModel)
         .onChange(async (v) => { plugin.settings.aiModel = v.trim(); await plugin.persist(); }));
+
+    new Setting(containerEl)
+      .setName("启用每日总结")
+      .setDesc("把当天的记录发给上面配置的接口。三项没配全时打开也不会有任何请求, 只会在日志里说一声。")
+      .addToggle((t) => t.setValue(plugin.settings.aiSummaryEnabled === true)
+        .onChange(async (v) => {
+          if (v && !(plugin.settings.aiApiUrl && plugin.settings.aiModel && plugin.getAiKey())) {
+            new Notice("接口地址、API Key、模型名三项都要填, 总结才跑得起来");
+          }
+          plugin.settings.aiSummaryEnabled = v;
+          await plugin.persist();
+        }));
+
+    new Setting(containerEl)
+      .setName("总结写入的节标题")
+      .setDesc("写在当天笔记里的二级标题。这一节由插件独占、每次总结覆盖重写(笔记里其他内容不动); 不能和记录节的标题相同。")
+      .addText((t) => {
+        let lastValid = plugin.settings.aiSummaryHeading || SUMMARY_DEFAULT_HEADING;
+        t.setPlaceholder(SUMMARY_DEFAULT_HEADING).setValue(lastValid)
+          .onChange(async (v) => {
+            const nh = normalizeHeading(v);
+            if (nh.error) return;   // 空/换行/超长: 保持上一个合法值, 不落盘
+            if (nh.value === plugin.writer._heading()) {
+              new Notice("不能和「" + plugin.writer._heading() + "」的节标题相同");
+              t.setValue(lastValid);
+              return;
+            }
+            lastValid = nh.value;
+            plugin.settings.aiSummaryHeading = nh.value;
+            await plugin.persist();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("微信推送时间")
+      .setDesc("总结在边界时刻就写好了, 到点才推微信——默认 08:00, 免得凌晨震手机。24 小时制, 如 08:00。")
+      .addText((t) => {
+        let lastValid = plugin.settings.aiSummaryPushTime || "08:00";
+        t.setPlaceholder("08:00").setValue(lastValid)
+          .onChange(async (v) => {
+            const val = (v || "").trim();
+            if (REMINDER_TIME_RE.test(val)) {
+              lastValid = val;
+              plugin.settings.aiSummaryPushTime = val;
+              await plugin.persist();
+            } else if (/^\d{1,2}:\d{2}$/.test(val)) {
+              new Notice("推送时间超出范围, 仍是 " + lastValid);
+              t.setValue(lastValid);
+            }
+            // 打到一半的中间态("0"): 什么都不做, 存储保持上一个合法值
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("立即总结昨天")
+      .setDesc("手动跑一次(不看开关, 但要求接口配全)。用来验证配置——也用来补跑昨天。")
+      .addButton((b) => b.setButtonText("开始总结").onClick(async () => {
+        b.setDisabled(true);
+        b.setButtonText("总结中…");
+        let r;
+        try { r = await plugin.summarizeDay(yesterdayStr(new Date())); }
+        catch (e) { r = { ok: false, message: "总结失败: " + ((e && e.message) || "?") }; }
+        b.setButtonText("开始总结");
+        b.setDisabled(false);
+        new Notice(r.message, 8000);
+      }));
   }
 }
 
@@ -6695,6 +7043,14 @@ const DEFAULT_DATA = () => ({
     // 每日提醒(D10): reminded_date=今天试过了(逻辑日, 一天只试一次); reminder_streak=连发几次提醒都没等来内容
     // (写入即清零, ≥3 闭嘴等人回来); reminder_idx=文案轮换指针; reminder_last_result=最近一次发送结果(诊断用)
     reminded_date: "", reminder_streak: 0, reminder_idx: 0, reminder_last_result: "",
+    // D15 AI 总结: summary_last_date = 已处理过的逻辑日(成功/放弃/没素材都记, 一天只做一次);
+    // summary_attempts + summary_attempt_day 必须成对——换天之后计数要归零, 否则会误伤新的一天;
+    // summary_push_day = 已写好待推送的日子; summary_push_attempts = 推送重试计数;
+    // summary_pending_delivery = 主动推送放弃后, 留给"用户下次说话时带出"的日子;
+    // summary_last_result = 最近一次结果(诊断用: 主动推送到底发不发得出去, 019 时代没人知道)。
+    summary_last_date: "", summary_attempts: 0, summary_attempt_day: "",
+    summary_push_day: "", summary_push_attempts: 0, summary_pending_delivery: "",
+    summary_last_result: "",
   },
 });
 
@@ -6810,8 +7166,10 @@ class WechatDiaryPlugin extends Plugin {
 
     // 每日提醒(D10): 每分钟查一次该不该提醒。到点时 Obsidian 没开也没关系——
     // 之后打开, 只要还在同一个逻辑日、今天还没记, 这里就会补发。
+    // D15 的 AI 总结搭同一班车(它有自己的重入闸, 不会被 60s 的节奏催出并发调用)。
     this.registerInterval(window.setInterval(() => {
       this._reminderTick().catch((e) => console.error("[wechat-diary] 提醒检查失败:", e));
+      this._summaryTick().catch((e) => console.error("[wechat-diary] 总结检查失败:", e));
     }, 60 * 1000));
 
     // 有 token 就起管道 —— 缺 userId 时进"待认领"模式(只推游标不落笔, 见 _handleIncoming),
@@ -7135,6 +7493,135 @@ class WechatDiaryPlugin extends Plugin {
     await this.persist();
   }
 
+  // ── D15: AI 每日总结的调度 ──────────────────────────────────────────────
+  // 唯一的执行入口, 设置页的「立即总结昨天」与定时 tick 都走它——不养第二套逻辑。
+  // 刻意不看 aiSummaryEnabled: 调用方负责判开关, 手动补跑就是要在开关之外也能跑。
+  // 返回 { ok, status, message, kind? }: status = ok | empty(没素材) | nokey | fail。
+  async summarizeDay(day) {
+    if (!this.ai.ready()) {
+      return { ok: false, status: "nokey", message: "接口地址、API Key、模型名三项要先填好" };
+    }
+    const src = await this.writer.readSummarySource(day);
+    if (!src) return { ok: false, status: "empty", message: day + " 没有可总结的微信记录" };
+    const meta = { model: this.settings.aiModel, time: todayStr() + " " + hhmmStr(), blocks: src.blocks };
+    let text;
+    try {
+      text = await this.ai.summarize(day, weekdayForDate(day), src.text);
+    } catch (e) {
+      return {
+        ok: false, status: "fail", kind: (e && e.kind) || "other",
+        message: "总结失败: " + ((e && e.message) || "?"),
+      };
+    }
+    const r = await this.writer.writeSummary(day, text, meta);
+    if (!r.ok) return { ok: false, status: "fail", kind: "write", message: "总结写进笔记失败: " + r.path };
+    return { ok: true, status: "ok", blocks: src.blocks, text, path: r.path, message: day + " 的总结已写进 " + r.path };
+  }
+
+  // 每 60s 被调一次。_summaryBusy 是重入闸: 一次总结最长可能跑 90s(接口超时), 不能让下一分钟
+  // 的 tick 再起一个并发调用。
+  async _summaryTick() {
+    if (this._summaryBusy) return;
+    const s = this.data.session;
+    if (!this.settings.aiSummaryEnabled) {
+      // 关掉开关 = 连待推送的也一起放弃(用户明确表示不想要了)。summary_last_date 保留:
+      // 再打开时不该补跑陈年旧账, 只从下一个边界开始。
+      if (s.summary_push_day || s.summary_pending_delivery) {
+        s.summary_push_day = ""; s.summary_push_attempts = 0; s.summary_pending_delivery = "";
+        s.summary_last_result = "disabled " + new Date().toISOString();
+        await this.persist();
+      }
+      return;
+    }
+    if (!this.ai.ready()) return;
+    this._summaryBusy = true;
+    try {
+      const now = new Date();
+      await this._summaryGenerateTick(now);
+      await this._summaryPushTick(now);
+    } finally {
+      this._summaryBusy = false;
+    }
+  }
+
+  // 阶段一: 逻辑日翻篇后总结刚结束的那天。不需要管道——纯本地读文件 + 一次接口调用。
+  async _summaryGenerateTick(now) {
+    if (!logicalDayFlipped(now)) return;      // 还在同一天里, 那天的记录没攒齐
+    const s = this.data.session;
+    const prevDay = yesterdayStr(now);        // 刚结束的逻辑日 = 日历上的昨天(边界之后恒成立)
+    const attempts = s.summary_attempt_day === prevDay ? (s.summary_attempts || 0) : 0;
+    if (!summaryDue({ enabled: true, aiReady: true, boundaryPassed: true, prevDay, lastDate: s.summary_last_date, attempts })) return;
+    s.summary_attempt_day = prevDay;
+    s.summary_attempts = attempts + 1;
+    await this.persist();   // 先记账再调用: 断在这中间也只是白试一次, 不会下次打开又从零开始
+    const r = await this.summarizeDay(prevDay);
+    if (r.status === "empty") {
+      s.summary_last_date = prevDay; s.summary_attempts = 0; s.summary_attempt_day = "";
+      s.summary_last_result = "skip " + prevDay + " 没素材";
+    } else if (r.ok) {
+      s.summary_last_date = prevDay; s.summary_attempts = 0; s.summary_attempt_day = "";
+      s.summary_push_day = prevDay; s.summary_push_attempts = 0;   // 交给阶段二, 到点再推
+      s.summary_last_result = "ok " + prevDay + " " + new Date().toISOString();
+      new Notice("微信随手记: " + prevDay + " 的 AI 总结已写进笔记");
+    } else {
+      s.summary_last_result = "fail " + prevDay + " " + (r.kind || "?") + " " + new Date().toISOString();
+      if ((s.summary_attempts || 0) >= SUMMARY_MAX_ATTEMPTS) {
+        s.summary_last_date = prevDay; s.summary_attempts = 0; s.summary_attempt_day = "";
+        s.summary_last_result += " (放弃)";
+        new Notice("微信随手记: " + prevDay + " 的总结连续失败 " + SUMMARY_MAX_ATTEMPTS + " 次, 这次先跳过");
+      }
+      console.error("[wechat-diary] AI 总结失败:", r.message);
+    }
+    await this.persist();
+  }
+
+  // 阶段二: 到点推微信。要管道活着(发送依赖用户入站产生的 context_token), 所以电脑没开就顺延到
+  // 下次打开——逻辑日时钟上"到点"是过了就不再回头的, 醒来补推正是想要的行为。
+  async _summaryPushTick(now) {
+    const s = this.data.session;
+    const day = s.summary_push_day;
+    if (!day) return;
+    if (!summaryPushDue({ enabled: true, pendingDay: day, attempts: s.summary_push_attempts || 0, timeStr: this.settings.aiSummaryPushTime || "08:00", now })) return;
+    const il = this.data.ilink;
+    if (!this._running || !this._client || !il.userId || this._isPaused()) return;
+    const text = await this.writer.readSummary(day);
+    if (!text) {   // 笔记里读不到(用户删了节): 没什么可推的, 清账走人
+      s.summary_push_day = ""; s.summary_push_attempts = 0;
+      s.summary_last_result = "push-skip " + day + " 笔记里读不到总结";
+      await this.persist();
+      return;
+    }
+    s.summary_push_attempts = (s.summary_push_attempts || 0) + 1;
+    await this.persist();   // 先记账再发: "发成功但响应丢了"不能变成双发(与每日提醒同款)
+    try {
+      await this._client.sendText(il.userId, summaryPushText(day, weekdayForDate(day), text, this.writer._summaryHeading()), il.contextTokens[il.userId]);
+      s.summary_push_day = ""; s.summary_push_attempts = 0;
+      s.summary_last_result = "push-ok " + day + " " + new Date().toISOString();
+    } catch (e) {
+      s.summary_last_result = "push-fail " + day + " " + ((e && (e.ilinkCode || e.message)) || "?") + " " + new Date().toISOString();
+      if (e && e.ilinkCode === STALE_TOKEN_ERRCODE) il.pauseUntil = Date.now() + SESSION_PAUSE_MS;
+      if ((s.summary_push_attempts || 0) >= SUMMARY_PUSH_MAX_ATTEMPTS) {
+        // 主动推不通(D3 早就说过这条链路不可靠): 改成等你下次说话时带出来, 不再重试
+        s.summary_push_day = ""; s.summary_push_attempts = 0;
+        s.summary_pending_delivery = day;
+        s.summary_last_result += " (改为下次对话带出)";
+      }
+      console.error("[wechat-diary] 总结推送失败:", e && e.message);
+    }
+    await this.persist();
+  }
+
+  // 主动推送失败后的兜底: 用户下次说话时把总结带出来。用户一开口就刷新了上下文窗口, 这个时机的
+  // 送达率远高于定时推送。取一次就清, 只带一次; 返回要追加的文本, 没有则 null。
+  async _takePendingSummaryDelivery() {
+    const day = this.data.session.summary_pending_delivery;
+    if (!day) return null;
+    this.data.session.summary_pending_delivery = "";
+    const text = await this.writer.readSummary(day);
+    if (!text) return null;
+    return summaryPushText(day, weekdayForDate(day), text, this.writer._summaryHeading());
+  }
+
   stopPipeline() {
     if (!this._running && !this._client) return;
     this._running = false;
@@ -7370,6 +7857,10 @@ WechatDiaryPlugin.__internals = {
   pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
   isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter, DiaryAgent,
   reminderDue, reminderText, sniffAudioExt, md5Hex, pcmToWav, silkToWav, getSilkLib,
+  // D15 AI 每日总结
+  logicalTimeReached, logicalDayFlipped, summaryDue, summaryPushDue,
+  summarySourceRegion, cleanSummarySource, sanitizeSummaryOutput, escapeSummaryHeaderLines,
+  splitSummarySection, joinSummarySection, buildSummaryBody, summaryPushText, SUMMARY_PROMPT, SUMMARY_DEFAULT_HEADING,
   // #15 路径层与共用文件模式
   renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
   normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,

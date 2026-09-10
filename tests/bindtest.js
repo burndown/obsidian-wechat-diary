@@ -1510,6 +1510,264 @@ async function newPlugin(secrets, storedData) {
     check("D14 用户明确设过的值不被默认值覆盖", pSet.settings.webClipEnabled === true && pSet.settings.saveVoiceAudio === false);
   }
 
+  console.log("\n【D15】AI 每日总结(2026-09-10): 边界生成 + 早上推送 + 记录区零影响");
+  {
+    const RDate = Date;
+    let dNow = RDate.parse("2026-09-11T04:00:00+08:00");
+    class DDate extends RDate {
+      constructor(...a) { if (a.length) super(...a); else super(dNow); }
+      static now() { return dNow; }
+    }
+    const at = (iso) => { dNow = RDate.parse(iso); };
+    global.Date = DDate;
+    I.setDayStartHour(4);
+    const H = "AI 总结";
+    try {
+      console.log("  — D15.1 逻辑日时钟(与每日提醒共用一条; 顺带回归 reminderDue 的抽取重构)");
+      at("2026-09-11T03:59:00+08:00");
+      check("D15 03:59 尚未翻篇(逻辑日还是 09-10)", I.logicalDayFlipped(new Date()) === false);
+      check("D15 边界之前: 同一逻辑日内的 08:00 已算到点", I.logicalTimeReached("08:00", new Date()) === true);
+      at("2026-09-11T04:00:00+08:00");
+      check("D15 04:00 翻篇", I.logicalDayFlipped(new Date()) === true);
+      check("D15 翻篇后推送时钟归零: 08:00 未到", I.logicalTimeReached("08:00", new Date()) === false);
+      at("2026-09-11T07:59:00+08:00");
+      check("D15 07:59 未到点", I.logicalTimeReached("08:00", new Date()) === false);
+      at("2026-09-11T08:00:00+08:00");
+      check("D15 08:00 到点", I.logicalTimeReached("08:00", new Date()) === true);
+      check("D15 非法时间串一律 false", I.logicalTimeReached("25:00", new Date()) === false && I.logicalTimeReached("", new Date()) === false);
+      at("2026-09-11T21:29:00+08:00");
+      check("D15 回归: 21:29 提醒不发", I.reminderDue({ enabled: true, timeStr: "21:30", now: new Date(), countToday: 0 }) === false);
+      at("2026-09-11T21:30:00+08:00");
+      check("D15 回归: 21:30 提醒照发(时钟抽取后语义不变)", I.reminderDue({ enabled: true, timeStr: "21:30", now: new Date(), countToday: 0 }) === true);
+      at("2026-09-11T23:59:00+08:00");
+      check("D15 回归: dayStartHour=4 时 23:59 也在提醒窗口内", I.reminderDue({ enabled: true, timeStr: "21:30", now: new Date(), countToday: 0 }) === true);
+
+      console.log("  — D15.2 summaryDue / summaryPushDue 表驱动");
+      const dueBase = { enabled: true, aiReady: true, boundaryPassed: true, prevDay: "2026-09-10", lastDate: "2026-09-09", attempts: 0 };
+      check("D15 条件齐 → 该总结", I.summaryDue(dueBase) === true);
+      check("D15 开关关 → 不总结", I.summaryDue(Object.assign({}, dueBase, { enabled: false })) === false);
+      check("D15 AI 没配好 → 不总结", I.summaryDue(Object.assign({}, dueBase, { aiReady: false })) === false);
+      check("D15 逻辑日没翻篇 → 不总结", I.summaryDue(Object.assign({}, dueBase, { boundaryPassed: false })) === false);
+      check("D15 这天已经做过 → 不总结", I.summaryDue(Object.assign({}, dueBase, { lastDate: "2026-09-10" })) === false);
+      check("D15 不回头补陈年旧账(lastDate 更晚) → 不总结", I.summaryDue(Object.assign({}, dueBase, { lastDate: "2026-09-11" })) === false);
+      check("D15 没素材 → 不总结", I.summaryDue(Object.assign({}, dueBase, { hasContent: false })) === false);
+      check("D15 试满 3 次 → 不总结", I.summaryDue(Object.assign({}, dueBase, { attempts: 3 })) === false);
+      check("D15 试了 2 次仍在重试 → 总结", I.summaryDue(Object.assign({}, dueBase, { attempts: 2 })) === true);
+      check("D15 历史为空(第一次) → 总结", I.summaryDue(Object.assign({}, dueBase, { lastDate: "" })) === true);
+      check("D15 空 ctx 不炸", I.summaryDue(null) === false && I.summaryDue(undefined) === false);
+      const pushBase = { enabled: true, pendingDay: "2026-09-10", attempts: 0, timeStr: "08:00", now: new Date("2026-09-11T08:00:00+08:00") };
+      check("D15 有总结待推 + 到点 → 推", I.summaryPushDue(pushBase) === true);
+      check("D15 没到点 → 不推", I.summaryPushDue(Object.assign({}, pushBase, { now: new Date("2026-09-11T07:00:00+08:00") })) === false);
+      check("D15 没有待推的 → 不推", I.summaryPushDue(Object.assign({}, pushBase, { pendingDay: "" })) === false);
+      check("D15 推满 3 次 → 不推", I.summaryPushDue(Object.assign({}, pushBase, { attempts: 3 })) === false);
+      check("D15 开关关 → 不推", I.summaryPushDue(Object.assign({}, pushBase, { enabled: false })) === false);
+
+      console.log("  — D15.3 素材只取微信随手记的内容(用户自己写的不外发)");
+      const DAYF = "2026-09-10";
+      const standalone = [
+        "---", "date: " + DAYF, "weekday: 周四", "source: wechat-diary", "---", "",
+        "# " + DAYF, "", "",
+        "**23:05**", "", "今天试了新的手冲豆子, 花香很明显。", "",
+        "![[日记/attachments/2026/2026-09-10-2305-a3f1.jpg]]", "",
+        "**23:40**", "", "🎤 明天上午十点要去医院复查", "",
+        "---", "_(今日封存于 23:50)_", "",
+      ].join("\n");
+      const stSrc = I.cleanSummarySource(I.summarySourceRegion(standalone, {}), 12000);
+      check("D15 独立模式: 2 段素材(图片块与封存线不算)", stSrc.blocks === 2, JSON.stringify(stSrc));
+      check("D15 独立模式: 正文保留, frontmatter/标题/附件/封存行全清掉",
+        stSrc.text.includes("手冲豆子") && stSrc.text.includes("🎤 明天上午十点") &&
+        !stSrc.text.includes("source: wechat-diary") && !stSrc.text.includes("# " + DAYF) &&
+        !stSrc.text.includes("attachments") && !stSrc.text.includes("今日封存"), stSrc.text);
+
+      const sharedNote = [
+        "# 我的每日笔记", "",
+        "## 工作", "", "上午开了会, 定了下季度目标。", "",
+        "## 微信随手记", "",
+        "**09:12**", "", "记下了开会时想到的一句话。", "",
+        "**21:30**", "", "今天有点累, 早点睡。", "",
+        "## 明天", "", "要交周报。", "",
+      ].join("\n");
+      const shSrc = I.cleanSummarySource(I.summarySourceRegion(sharedNote, { shared: true, heading: "微信随手记" }), 12000);
+      check("D15 共用模式: 只取节内 2 段", shSrc.blocks === 2, JSON.stringify(shSrc));
+      check("D15 共用模式: 节外用户内容一个字都不进去",
+        !shSrc.text.includes("开了会") && !shSrc.text.includes("要交周报") && shSrc.text.includes("早点睡"), shSrc.text);
+
+      const foreign = ["# 我自己的日记", "", "上午写了点东西。", "", "**10:00**", "", "这是微信来的第一段。"].join("\n");
+      const foSrc = I.cleanSummarySource(I.summarySourceRegion(foreign, { foreign: true }), 12000);
+      check("D15 外来文件: 只取第一个段头之后", foSrc.blocks === 1 && foSrc.text.includes("微信来的第一段") && !foSrc.text.includes("上午写了点东西"), JSON.stringify(foSrc));
+
+      const emptySrc = I.cleanSummarySource(I.summarySourceRegion("# 2026-09-10\n\n", {}), 12000);
+      check("D15 只有壳没有内容 → blocks=0(不调用 AI)", emptySrc.blocks === 0, JSON.stringify(emptySrc));
+      const longSrc = I.cleanSummarySource("**10:00**\n\n" + "字".repeat(200), 50);
+      check("D15 素材超长 → 截断并注明", longSrc.truncated === true && longSrc.text.includes("已截断") && longSrc.text.length < 90, JSON.stringify(longSrc));
+
+      console.log("  — D15.4 模型输出消毒(派生内容不许破坏记录区的解析)");
+      check("D15 空输出 → 空串(按失败重试, 不落盘)", I.sanitizeSummaryOutput("   ") === "" && I.sanitizeSummaryOutput(null) === "");
+      const q1 = I.sanitizeSummaryOutput("```markdown\n主线: 去医院复查。\n\n- 复查\n```");
+      check("D15 去掉整体代码围栏", !q1.includes("```") && q1.startsWith("主线: 去医院复查。"), JSON.stringify(q1));
+      const q2 = I.sanitizeSummaryOutput("以下是今天的总结:\n# 今日总结\n主线: 修好了水管。\n\n- 换了垫片");
+      check("D15 去掉模型自加的标题行与开场白", !q2.includes("今日总结") && !q2.includes("以下是") && q2.startsWith("主线: 修好了水管。"), JSON.stringify(q2));
+      check("D15 剥掉整段外层引号", I.sanitizeSummaryOutput("“今天很充实。”") === "今天很充实。", JSON.stringify(I.sanitizeSummaryOutput("“今天很充实。”")));
+      const q4 = I.sanitizeSummaryOutput("**09:30**\n\n- 约了牙医");
+      check("D15 段头形状的行被转义(HEADER_RE_G 再也认不出)", !/\*\*\d{1,2}:\d{2}\*\*/.test(q4) && q4.includes("约了牙医"), JSON.stringify(q4));
+      const q5 = I.sanitizeSummaryOutput("## 小结\n正文在此");
+      check("D15 模型加的 # 行被转义(抢不走节的边界)", !/^#{1,6} /m.test(q5) && q5.includes("正文在此"), JSON.stringify(q5));
+      const q6 = I.sanitizeSummaryOutput("字".repeat(2000));
+      check("D15 输出超长 → 截断", q6.length < 1700 && q6.includes("已截断"), String(q6.length));
+
+      console.log("  — D15.5 记录区 / 总结节的拆分拼接(字节保真)");
+      const noSum = "---\ndate: x\n---\n\n# x\n\n**10:00**\n\nabc\n";
+      const sp0 = I.splitSummarySection(noSum, H);
+      check("D15 没有总结节: rec 逐字节等于原文, summary 为空", sp0.rec === noSum && sp0.summary === "");
+      check("D15 没有总结节: 拼回也不动字节", I.joinSummarySection(sp0.rec, sp0.summary) === noSum);
+      const withSum = noSum + "\n## " + H + "\n\n> 出处\n\n正文\n";
+      const sp1 = I.splitSummarySection(withSum, H);
+      check("D15 拆开再拼回 = 逐字节相同", I.joinSummarySection(sp1.rec, sp1.summary) === withSum, JSON.stringify([sp1.rec, sp1.summary]));
+      check("D15 记录区里没有总结节, 总结节从标题行开始", !sp1.rec.includes(H) && sp1.summary.startsWith("## " + H));
+      check("D15 总结为空时不改 rec", I.joinSummarySection("abc\n", "") === "abc\n");
+      check("D15 拼接保证标题另起一段(贴着正文会被当成普通段落)", I.joinSummarySection("abc\n", "## " + H + "\n\nx\n") === "abc\n\n## " + H + "\n\nx\n");
+
+      console.log("  — D15.6 真 DiaryWriter 落盘(独立模式): 记录区语义不被派生内容污染");
+      function dv() {
+        const files = {};
+        return {
+          files,
+          getFileByPath: (x) => (x in files ? { path: x } : null),
+          getAbstractFileByPath: (x) => (x in files ? { path: x } : null),
+          getFolderByPath: () => ({}), createFolder: async () => {},
+          create: async (x, c) => { files[x] = c; },
+          process: async (f, fn) => { files[f.path] = fn(files[f.path]); return files[f.path]; },
+          cachedRead: async (f) => files[f.path],
+        };
+      }
+      const v1 = dv();
+      const W = new I.DiaryWriter({ app: { vault: v1 }, settings: { diaryFolder: "日记" } }, null);
+      const D = "2026-09-10";
+      await W.write("第一段", false, D);
+      await W.write("第二段", false, D);
+      const P = W.diaryPath(D);
+      check("D15 起始 2 段", (await W.countDay(D)) === 2, String(await W.countDay(D)));
+      const wr = await W.writeSummary(D, "主线: 两段记录。\n\n- 要点一", { model: "m1", time: "2026-09-11 04:00", blocks: 2 });
+      check("D15 写总结 ok 且路径正确", wr.ok === true && wr.path === P);
+      check("D15 笔记里有总结节与出处行",
+        v1.files[P].includes("## " + H) && v1.files[P].includes("由 m1 生成") && v1.files[P].includes("2 段素材") && v1.files[P].includes("要点一"), v1.files[P]);
+      check("D15 总结节在文件末尾(记录区之后)", v1.files[P].trimEnd().endsWith("要点一"), JSON.stringify(v1.files[P].slice(-50)));
+      check("D15 段数不被总结污染: 仍是 2", (await W.countDay(D)) === 2, String(await W.countDay(D)));
+      const w3 = await W.write("第三段", false, D);
+      check("D15 有总结后新写: 回执说第 3 段(不是第 5 段)", w3.n === 3, String(w3.n));
+      check("D15 新记录插在总结节之前", v1.files[P].indexOf("第三段") < v1.files[P].indexOf("## " + H), v1.files[P]);
+      const u1 = await W.undoLastBlock(D);
+      check("D15 撤回撤的是记录不是总结", u1.ok && u1.removed === "第三段" && v1.files[P].includes("## " + H) && v1.files[P].includes("要点一"), JSON.stringify(u1));
+      const fz = await W.finalizeDay(D);
+      check("D15 封存 n 只数记录(2)", fz.status === "sealed" && fz.n === 2, JSON.stringify(fz));
+      check("D15 封存行落在总结节之前, 总结仍在文件末尾",
+        v1.files[P].indexOf(I.texts.CLOSING_MARKER) < v1.files[P].indexOf("## " + H) && v1.files[P].trimEnd().endsWith("要点一"), v1.files[P]);
+      const wr2 = await W.writeSummary(D, "主线: 重算后的版本。", { model: "m2", time: "2026-09-11 09:00", blocks: 2 });
+      check("D15 重算 = 覆盖而不是再堆一份", wr2.ok && v1.files[P].split("## " + H).length === 2 && v1.files[P].includes("重算后的版本") && !v1.files[P].includes("要点一"), v1.files[P]);
+      const beforeIdem = v1.files[P];
+      const fz2 = await W.finalizeDay(D);
+      check("D15 重复封存是空操作且不动一个字节", fz2.status === "already" && v1.files[P] === beforeIdem, JSON.stringify([fz2, v1.files[P] === beforeIdem]));
+      // 记录区与总结节之间被手工插了空行: 空操作也不许把它归一化掉
+      v1.files[P] = beforeIdem.replace("\n## " + H, "\n\n\n## " + H);
+      const beforeIdem2 = v1.files[P];
+      const fz3 = await W.finalizeDay(D);
+      check("D15 手工空行不被空操作吃掉(join 只在真改动时归一化)", fz3.status === "already" && v1.files[P] === beforeIdem2, JSON.stringify(v1.files[P].slice(-80)));
+      check("D15 readSummary 去掉出处行只留正文", (await W.readSummary(D)) === "主线: 重算后的版本。", JSON.stringify(await W.readSummary(D)));
+      const src = await W.readSummarySource(D);
+      check("D15 重算素材不含上一次的总结(不会自我循环)",
+        src.blocks === 2 && src.text.includes("第一段") && !src.text.includes("重算后的版本") && !src.text.includes("今日封存"), JSON.stringify(src));
+
+      console.log("  — D15.7 共用模式: 用户自己的内容逐字节不动");
+      const v2 = dv();
+      const W2 = new I.DiaryWriter({ app: { vault: v2 }, settings: { diaryFolder: "日记", sharedDailyNote: true, sectionHeading: "微信随手记" } }, null);
+      const D2 = "2026-09-10";
+      const P2 = W2.diaryPath(D2);
+      v2.files[P2] = "# 我的笔记\n\n## 工作\n\n上午开会。\n\n## 微信随手记\n\n**09:12**\n\n记了一件事。\n\n## 明天\n\n交周报。\n";
+      const before2 = v2.files[P2];
+      await W2.writeSummary(D2, "主线: 记了一件事。", { model: "m", time: "t", blocks: 1 });
+      check("D15 共用模式: 原文是前缀, 用户内容一字未动",
+        v2.files[P2].startsWith(before2) && v2.files[P2].includes("上午开会。") && v2.files[P2].includes("交周报。"), JSON.stringify(v2.files[P2]));
+      check("D15 共用模式: 总结节追加在末尾", v2.files[P2].trimEnd().endsWith("主线: 记了一件事。"));
+      check("D15 共用模式: 段数不受影响", (await W2.countDay(D2)) === 1, String(await W2.countDay(D2)));
+      const shSrc2 = await W2.readSummarySource(D2);
+      check("D15 共用模式: 只把节内内容发给 AI",
+        shSrc2.blocks === 1 && shSrc2.text.includes("记了一件事") && !shSrc2.text.includes("上午开会") && !shSrc2.text.includes("交周报"), JSON.stringify(shSrc2));
+      await W2.write("节里再加一条", false, D2);
+      check("D15 共用模式: 加记录后节仍在, 总结也在", v2.files[P2].includes("节里再加一条") && v2.files[P2].includes("## " + H) && v2.files[P2].trimEnd().endsWith("主线: 记了一件事。"), v2.files[P2]);
+      await W2.undoLastBlock(D2);
+      check("D15 共用模式: 撤回撤的是节内记录, 总结节完好", !v2.files[P2].includes("节里再加一条") && v2.files[P2].includes("## " + H));
+
+      console.log("  — D15.8 标题冲突兜底 + 默认值");
+      const v3c = dv();
+      const WC = new I.DiaryWriter({ app: { vault: v3c }, settings: { diaryFolder: "日记", aiSummaryHeading: "微信随手记" } }, null);
+      check("D15 总结节标题与记录节同名 → 兜底换回默认值", WC._summaryHeading() === I.SUMMARY_DEFAULT_HEADING, WC._summaryHeading());
+      check("D15 DEFAULT_SETTINGS 默认关", I.DEFAULT_SETTINGS.aiSummaryEnabled === false, String(I.DEFAULT_SETTINGS.aiSummaryEnabled));
+      check("D15 默认节标题与推送时间", I.DEFAULT_SETTINGS.aiSummaryHeading === I.SUMMARY_DEFAULT_HEADING && I.DEFAULT_SETTINGS.aiSummaryPushTime === "08:00");
+      const pOld2 = await newPlugin({}, { settings: { diaryFolder: "日记", aiApiUrl: "https://x/y", aiModel: "m" } });
+      check("D15 老 data.json 升级: 没设过 → 总结默认关", pOld2.settings.aiSummaryEnabled === false, String(pOld2.settings.aiSummaryEnabled));
+
+      console.log("  — D15.9 插件调度: 边界生成 → 早上推送 → 失败降级");
+      const SECRET_AI = "wechat-diary-ai-api-key";
+      const v4 = dv();
+      const pk = await newPlugin({ [SECRET_AI]: "K1", [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+      pk.app.vault = v4;
+      pk.settings.aiApiUrl = "https://api.example.com/v1/chat/completions";
+      pk.settings.aiModel = "test-model";
+      pk.settings.aiSummaryEnabled = true;
+      pk.settings.aiSummaryPushTime = "08:00";
+      let aiCalls = 0;
+      const sent = [];
+      pk.ai = { ready: () => true, summarize: async (day, wd, src) => { aiCalls++; return "主线: " + String(src).slice(0, 10) + "\n\n- 要点"; } };
+      const D3 = "2026-09-10";
+      await pk.writer.write("昨天的第一段", false, D3);
+      at("2026-09-11T03:59:00+08:00");
+      await pk._summaryTick();
+      check("D15 边界之前不生成", aiCalls === 0 && !pk.data.session.summary_last_date, String(aiCalls));
+      at("2026-09-11T04:00:00+08:00");
+      await pk._summaryTick();
+      check("D15 边界之后生成 1 次", aiCalls === 1, String(aiCalls));
+      check("D15 记下已处理日与待推日", pk.data.session.summary_last_date === D3 && pk.data.session.summary_push_day === D3, JSON.stringify(pk.data.session));
+      check("D15 总结写进了笔记", v4.files[pk.writer.diaryPath(D3)].includes("主线: ") && v4.files[pk.writer.diaryPath(D3)].includes("要点"));
+      await pk._summaryTick();
+      check("D15 同一天不重复调用 AI", aiCalls === 1, String(aiCalls));
+      pk._running = true;
+      pk._client = { sendText: async (to, text) => { sent.push({ to, text }); return true; } };
+      at("2026-09-11T07:00:00+08:00");
+      await pk._summaryTick();
+      check("D15 到点之前不推微信", sent.length === 0);
+      at("2026-09-11T08:00:00+08:00");
+      await pk._summaryTick();
+      check("D15 到点推一次", sent.length === 1, JSON.stringify(sent));
+      check("D15 推文含总结正文与日期指向", !!sent[0] && sent[0].to === "U1" && sent[0].text.includes("要点") && sent[0].text.includes(D3), JSON.stringify(sent[0]));
+      check("D15 推完清账", pk.data.session.summary_push_day === "" && pk.data.session.summary_last_result.startsWith("push-ok"), JSON.stringify(pk.data.session));
+
+      at("2026-09-12T04:00:00+08:00");
+      await pk.writer.write("新的一天", false, "2026-09-11");
+      await pk._summaryTick();
+      check("D15 第二天照常生成, 且不当场推(等 08:00)", pk.data.session.summary_push_day === "2026-09-11" && aiCalls === 2, JSON.stringify(pk.data.session));
+      pk._client = { sendText: async () => { throw new Error("发送超时"); } };
+      at("2026-09-12T08:00:00+08:00");
+      await pk._summaryTick();
+      await pk._summaryTick();
+      await pk._summaryTick();
+      check("D15 连推 3 次失败 → 清掉主动推, 转「下次对话带出」",
+        pk.data.session.summary_push_day === "" && pk.data.session.summary_pending_delivery === "2026-09-11", JSON.stringify(pk.data.session));
+      const carried = await pk._takePendingSummaryDelivery();
+      check("D15 兜底: 下次对话把总结带出来", typeof carried === "string" && carried.includes("新的一天") && carried.includes("2026-09-11"), JSON.stringify(carried));
+      check("D15 只带一次", (await pk._takePendingSummaryDelivery()) === null);
+      pk.data.session.summary_push_day = "2026-09-11";
+      pk.settings.aiSummaryEnabled = false;
+      await pk._summaryTick();
+      check("D15 关掉开关 → 待推的也一起放弃", pk.data.session.summary_push_day === "" && pk.data.session.summary_last_result.startsWith("disabled"), JSON.stringify(pk.data.session));
+
+      const at05 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+      check("D15 没配 AI → summarizeDay 直接说清楚, 不发任何请求", (await at05.summarizeDay("2026-09-10")).status === "nokey");
+    } finally {
+      global.Date = RDate;
+      I.setDayStartHour(4);
+    }
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);
