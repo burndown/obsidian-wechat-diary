@@ -623,6 +623,12 @@ README 与 data-contract 里对这条例外都要写明。
 本轮先用掉，#14 顺延到下一个版本号。仓库的发版惯例是只 bump `manifest.json` + `versions.json`——
 `main.js` 里的 `PLUGIN_VERSION` 是协议头里的 agent 串，自 0.3.0 起不随发版变动（0.3.1 与 0.4.0 两次发版均未动）。
 
+**0.5.0 同时是仓库的第一个 tag + Release**：0.1.0–0.4.0 都只 bump 了 main 上的 `manifest.json`，
+从未打过 tag（`15-daily-note-mode-draft.md` 里写的「三件套照发」当时只是计划，没执行）。
+从这版起走 Release 分发：tag `0.5.0` 指向 `808c1fb`，Release 附 `main.js` / `manifest.json` / `styles.css`
+三件套（已核对与仓库文件逐字节一致），BRAT 可以按 `burndown/obsidian-wechat-diary` 装了。
+后续版本沿用这条路径即可。
+
 ---
 
 ## 已知的 019 待修问题（020 别照抄，019 以后也要修）
