@@ -108,11 +108,14 @@ function momentStub(input, fmt) {
   };
 }
 
+// main.js 是在 require 时把 requestUrl 解构取走的, 所以模拟真实 HTTP 响应只能换"它调用的实现",
+// 换 stub.requestUrl 没用。默认仍返回 {}, 与老行为逐字一致。
+let requestUrlImpl = async () => ({});
 const stub = {
   Plugin, PluginSettingTab, Setting, Modal, Notice, AbstractInputSuggest,
   moment: momentStub,
   normalizePath: (p) => p,
-  requestUrl: async () => ({}),
+  requestUrl: (...a) => requestUrlImpl(...a),
   Platform: { isDesktop: true },
 };
 
@@ -1853,6 +1856,38 @@ async function newPlugin(secrets, storedData) {
       const repWriteFail = await pe.agent._dispatch("总结", false, [], null);
       pe.writer.writeSummary = realWrite;
       check("D15 写笔记失败 → 内容照给, 但明说没存下", repWriteFail.includes("拿到了但存不下") && repWriteFail.includes("没能写进笔记"), repWriteFail);
+
+      console.log("  — D15.11 AI 报错要说人话(线上实测 2026-09-10: 只回「HTTP 404」用户没法动手)");
+      check("D15 404 的原因直接点出两种可能", I.aiErrorText("not_found").includes("/v1/chat/completions") && I.aiErrorText("not_found").includes("模型名"), I.aiErrorText("not_found"));
+      check("D15 微信回执与 Notice 共用一张原因表(不会各写一份漂移)", I.summaryFailReply("not_found").includes(I.AI_KIND_TEXT.not_found));
+      check("D15 微信回执不带服务端原文(手机上不该看一坨 JSON)", I.aiErrorText("not_found", { detail: '{"error":"x"}' }, false) === I.AI_KIND_TEXT.not_found);
+      check("D15 桌面 Notice 带服务端原文", I.aiErrorText("not_found", { detail: "model not found" }, true).includes("model not found"));
+      check("D15 shortBody 压掉换行并截断", I.shortBody({ text: "a\n\nb " + "x".repeat(500) }) === ("a b " + "x".repeat(500)).slice(0, 200), JSON.stringify(I.shortBody({ text: "a\n\nb" })));
+      check("D15 shortBody 对没有 text 的响应不炸", I.shortBody({}) === "" && I.shortBody(null) === "");
+      requestUrlImpl = async () => ({ status: 404, text: '{\n "error": {\n  "message": "model not found"\n }\n}' });
+      const vErr = dv();
+      const pErr = await newPlugin({ [SECRET_AI]: "K1" }, BOUND_DATA());
+      pErr.app.vault = vErr;
+      pErr.settings.aiApiUrl = "https://api.example.com/v1/chat/completions";
+      pErr.settings.aiModel = "no-such-model";
+      pErr.settings.aiSummaryEnabled = true;
+      await pErr.writer.write("今天记了一条", false, ON_DAY);
+      let thrown = null;
+      try { await pErr.ai.chatCompletion([{ role: "user", content: "hi" }], 0.3, 5000); } catch (e) { thrown = e; }
+      check("D15 真跑一遍: HTTP 404 → kind=not_found 且记录 status", !!thrown && thrown.kind === "not_found" && thrown.status === 404, JSON.stringify(thrown && { kind: thrown.kind, status: thrown.status }));
+      check("D15 服务端原话被压成一行带出来", !!thrown && thrown.detail === '{ "error": { "message": "model not found" } }', thrown && thrown.detail);
+      const r404 = await pErr.summarizeDay(ON_DAY);
+      check("D15 总结失败的消息点明地址/模型名并附服务端原话",
+        r404.status === "fail" && r404.kind === "not_found" && r404.message.includes("接口地址或模型名不对") && r404.message.includes("model not found"), r404.message);
+      check("D15 404 不落笔(笔记里没有总结节)", !(vErr.files[pErr.writer.diaryPath(ON_DAY)] || "").includes("## " + I.SUMMARY_DEFAULT_HEADING));
+      const rep404 = await pErr.agent._dispatch("总结", false, [], null);
+      check("D15 微信回执也点明 404 是地址/模型名的问题", rep404.includes("接口地址或模型名不对"), rep404);
+      requestUrlImpl = async () => ({ status: 401, text: '{"error":{"message":"invalid api key"}}' });
+      let thrown401 = null;
+      try { await pErr.ai.chatCompletion([{ role: "user", content: "hi" }], 0.3, 5000); } catch (e) { thrown401 = e; }
+      check("D15 回归: HTTP 401 仍归 auth", !!thrown401 && thrown401.kind === "auth", JSON.stringify(thrown401 && thrown401.kind));
+      check("D15 401 的回执仍说 Key 不对", (await pErr.agent._dispatch("总结", false, [], null)).includes("AI Key 好像不对"));
+      requestUrlImpl = async () => ({});   // 复原, 免得影响后面的用例
     } finally {
       global.Date = RDate;
       I.setDayStartHour(4);

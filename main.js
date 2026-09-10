@@ -3161,9 +3161,39 @@ const SUMMARY_PROMPT = `用户在 {day} ({weekday}) 通过微信随手记发来�
 - 不要给建议清单, 不要写"希望对你有帮助"这类客套
 - 直接输出正文: 不要标题行(# 开头)、不要代码块、不要"以下是总结"这类开场白`;
 
-// 【宿主适配】auth 一条: .env 概念改为插件设置
+// AI 调用失败 → 一句人话。单列 not_found 是因为线上实测(2026-09-10, 谷雨仓库实测):
+// 只回一句「HTTP 404」用户完全没法动手——它几乎总是"地址没写到 /v1/chat/completions"或
+// "模型名这家不认", 必须把这两种可能直接写出来。
+const AI_KIND_TEXT = {
+  no_key: "还没配 AI Key",
+  auth: "AI Key 好像不对或没权限",
+  balance: "AI 余额用完了",
+  rate_limit: "AI 调用太频繁",
+  network: "AI 暂时不通(检查接口地址或网络)",
+  server: "AI 服务异常",
+  not_found: "接口地址或模型名不对(HTTP 404): 地址一般要写到 /v1/chat/completions, 模型名要是那家支持的",
+  other: "AI 出了点问题",
+};
+// err 可带 detail(服务端返回的原文片段)。微信回执只要原因(withDetail=false, 手机上不该看一坨 JSON);
+// 桌面 Notice 与日志带上服务端原话(withDetail=true)——404/400 的正文通常直接说明是路径还是模型的问题。
+function aiErrorText(kind, err, withDetail) {
+  const base = AI_KIND_TEXT[kind] || AI_KIND_TEXT.other;
+  const d = err && err.detail ? String(err.detail).trim() : "";
+  return withDetail && d ? base + " | 服务端说: " + d : base;
+}
+
+// 非 2xx 时把服务端的话带出来。截到 200 字、压掉换行, 免得 Notice 被一坨 JSON 撑爆。
+function shortBody(res) {
+  try {
+    return String((res && res.text) || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  } catch (e) { return ""; }
+}
+
+// 【宿主适配】auth 一条: .env 概念改为插件设置。
+// 文案与 AI_KIND_TEXT 分工不同: 这里拼在"原文已存"的回执尾部(polish 用), 那边是给用户的原因说明。
 const NET_NOTE_BY_KIND = {
   auth: " (AI Key 好像不对呢, 检查下插件设置, 原文已存)",
+  not_found: " (这个接口地址找不到, 检查设置里的地址和模型名, 原文已存)",
   balance: " (AI 余额用完啦, 充值后试试, 原文已存)",
   rate_limit: " (AI 调用太频繁, 原文已存)",
   network: " (AI 暂时不通, 原文已存)",
@@ -3203,8 +3233,12 @@ class AiClient {
     }
     const status = res.status;
     if (status < 200 || status >= 300) {
-      const e = new Error("HTTP " + status);
-      e.kind = status === 401 ? "auth" : status === 402 ? "balance" : status === 429 ? "rate_limit" : status >= 500 ? "server" : "other";
+      const detail = shortBody(res);
+      const e = new Error("HTTP " + status + (detail ? ": " + detail : ""));
+      e.kind = status === 401 ? "auth" : status === 402 ? "balance" : status === 429 ? "rate_limit"
+        : status === 404 ? "not_found" : status >= 500 ? "server" : "other";
+      e.status = status;
+      e.detail = detail;   // 给 aiErrorText 用: 服务端原话比状态码有用得多
       throw e;
     }
     let data;
@@ -4606,11 +4640,7 @@ const SUMMARY_OFF_REPLY = "AI 总结还没打开~ 到 Obsidian 设置 → 第三
 const SUMMARY_EMPTY_REPLY = "今天还没记东西呢~ 先记点, 再说「总结」📖";
 
 function summaryFailReply(kind) {
-  const why = {
-    no_key: "还没配 AI Key", auth: "AI Key 好像不对", balance: "AI 余额用完了",
-    rate_limit: "调用太频繁了", network: "AI 暂时不通", server: "AI 服务异常",
-  }[kind] || "AI 出了点问题";
-  return "⚠️ " + why + ", 这次总结没做出来。你记的内容都好好的在笔记里, 等会儿再说一次「总结」📖";
+  return "⚠️ " + AI_KIND_TEXT[kind] + ", 这次总结没做出来。你记的内容都好好的在笔记里, 等会儿再说一次「总结」📖";
 }
 
 class DiaryWriter {
@@ -7598,9 +7628,11 @@ class WechatDiaryPlugin extends Plugin {
     try {
       text = await this.ai.summarize(day, weekdayForDate(day), src.text);
     } catch (e) {
+      const kind = (e && e.kind) || "other";
       return {
-        ok: false, status: "fail", kind: (e && e.kind) || "other",
-        message: "总结失败: " + ((e && e.message) || "?"),
+        ok: false, status: "fail", kind,
+        // 带服务端原话(截断到 300 字): 404 这类必须让用户看到是哪一步不对
+        message: ("总结失败: " + aiErrorText(kind, e, true)).slice(0, 300),
       };
     }
     const r = await this.writer.writeSummary(day, text, meta);
@@ -7957,6 +7989,7 @@ WechatDiaryPlugin.__internals = {
   // D15 补「总结」命令
   SUMMARY_KEYWORDS, summaryOnDemandReply, summaryFailReply,
   texts3: { SUMMARY_NO_KEY_REPLY, SUMMARY_OFF_REPLY, SUMMARY_EMPTY_REPLY },
+  AI_KIND_TEXT, aiErrorText, shortBody,
   // #15 路径层与共用文件模式
   renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
   normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,
