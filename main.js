@@ -7061,7 +7061,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("模型名")
-      .addText((t) => t.setPlaceholder("deepseek-chat")
+      .setDesc("填那家平台文档里给的模型名。DeepSeek 当前是 deepseek-flash(旧名 deepseek-v4-flash 仍可调用); 本地 Ollama 填 ollama list 里的名字。")
+      .addText((t) => t.setPlaceholder("deepseek-flash")
         .setValue(plugin.settings.aiModel)
         .onChange(async (v) => { plugin.settings.aiModel = v.trim(); await plugin.persist(); }));
 
