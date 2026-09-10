@@ -1703,8 +1703,10 @@ async function newPlugin(secrets, storedData) {
       check("D15 总结节标题与记录节同名 → 兜底换回默认值", WC._summaryHeading() === I.SUMMARY_DEFAULT_HEADING, WC._summaryHeading());
       check("D15 DEFAULT_SETTINGS 默认关", I.DEFAULT_SETTINGS.aiSummaryEnabled === false, String(I.DEFAULT_SETTINGS.aiSummaryEnabled));
       check("D15 默认节标题与推送时间", I.DEFAULT_SETTINGS.aiSummaryHeading === I.SUMMARY_DEFAULT_HEADING && I.DEFAULT_SETTINGS.aiSummaryPushTime === "08:00");
+      check("D15 定时子开关也默认关(按需触发才是多数人想要的)", I.DEFAULT_SETTINGS.aiSummaryScheduled === false, String(I.DEFAULT_SETTINGS.aiSummaryScheduled));
       const pOld2 = await newPlugin({}, { settings: { diaryFolder: "日记", aiApiUrl: "https://x/y", aiModel: "m" } });
       check("D15 老 data.json 升级: 没设过 → 总结默认关", pOld2.settings.aiSummaryEnabled === false, String(pOld2.settings.aiSummaryEnabled));
+      check("D15 老 data.json 升级: 定时子开关也默认关", pOld2.settings.aiSummaryScheduled === false, String(pOld2.settings.aiSummaryScheduled));
 
       console.log("  — D15.9 插件调度: 边界生成 → 早上推送 → 失败降级");
       const SECRET_AI = "wechat-diary-ai-api-key";
@@ -1714,6 +1716,7 @@ async function newPlugin(secrets, storedData) {
       pk.settings.aiApiUrl = "https://api.example.com/v1/chat/completions";
       pk.settings.aiModel = "test-model";
       pk.settings.aiSummaryEnabled = true;
+      pk.settings.aiSummaryScheduled = true;   // 这一段测的是定时那条路(2026-09-10 起它与主开关拆开, 默认关)
       pk.settings.aiSummaryPushTime = "08:00";
       let aiCalls = 0;
       const sent = [];
@@ -1758,10 +1761,98 @@ async function newPlugin(secrets, storedData) {
       pk.data.session.summary_push_day = "2026-09-11";
       pk.settings.aiSummaryEnabled = false;
       await pk._summaryTick();
-      check("D15 关掉开关 → 待推的也一起放弃", pk.data.session.summary_push_day === "" && pk.data.session.summary_last_result.startsWith("disabled"), JSON.stringify(pk.data.session));
+      check("D15 关掉开关 → 待推的也一起放弃", pk.data.session.summary_push_day === "" && pk.data.session.summary_last_result.startsWith("scheduled-off"), JSON.stringify(pk.data.session));
 
       const at05 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
       check("D15 没配 AI → summarizeDay 直接说清楚, 不发任何请求", (await at05.summarizeDay("2026-09-10")).status === "nokey");
+
+      console.log("  — D15.10 「总结」命令: 识别 / 按需总结今天到现在 / 防手抖 / 各前置失败");
+      // 识别: 只认光杆短句, 语气词与引号标点由 normalizeIntent 剥掉
+      check("D15 「总结」→ SUMMARY", I.detectIntent("总结").intent === I.INTENT.SUMMARY);
+      for (const kw of ["总结吧", "总结一下", "总结今天", "帮我总结一下", "给我总结", "“总结”", "总结！", "总结一下今天"]) {
+        check("D15 「" + kw + "」→ SUMMARY", I.detectIntent(kw).intent === I.INTENT.SUMMARY, I.detectIntent(kw).intent);
+      }
+      // 门槛: 可能是内容就不收——长句、单字尾「了」、「小结/复盘/摘要」一律照记
+      check("D15 「总结了」是内容(不认)", I.detectIntent("总结了").intent === I.INTENT.DIARY);
+      check("D15 长句里的总结是内容", I.detectIntent("今天开完会写了个总结").intent === I.INTENT.DIARY);
+      check("D15 「明天总结一下这个项目」是内容", I.detectIntent("明天总结一下这个项目").intent === I.INTENT.DIARY);
+      check("D15 「小结」「复盘」都不收(更容易是内容)", I.detectIntent("小结").intent === I.INTENT.DIARY && I.detectIntent("复盘").intent === I.INTENT.DIARY);
+      check("D15 「记：总结」逃生口照旧 → 原样落库", I.detectIntent("记：总结").intent === I.INTENT.DIARY && I.detectIntent("记：总结").forced === true);
+
+      at("2026-09-12T22:00:00+08:00");
+      const ON_DAY = "2026-09-12";
+      const v5 = dv();
+      const pd = await newPlugin({ [SECRET_AI]: "K1", [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+      pd.app.vault = v5;
+      pd.settings.aiApiUrl = "https://api.example.com/v1/chat/completions";
+      pd.settings.aiModel = "test-model";
+      pd.settings.aiSummaryEnabled = true;
+      // 刻意不开 aiSummaryScheduled: 这一段要证明「按需触发与定时那条路互不依赖」
+      check("D15 只开主开关(定时关)也能按需总结", pd.settings.aiSummaryScheduled === false);
+      let onCalls = 0, onDay = "", onSrc = "";
+      pd.ai = { ready: () => true, summarize: async (day, wd, src) => { onCalls++; onDay = day; onSrc = src; return "主线: 今天忙了不少事。\n\n- 上午搬家\n- 下午修水管"; } };
+      await pd.writer.write("上午搬家", false, ON_DAY);
+      await pd.writer.write("下午修水管", false, ON_DAY);
+      const rep1 = await pd.agent._dispatch("总结", false, [], null);
+      check("D15 按需总结: 总结的是今天(逻辑日)", onDay === ON_DAY, onDay);
+      check("D15 按需总结: 素材是今天的记录", onSrc.includes("搬家") && onSrc.includes("修水管"), JSON.stringify(onSrc));
+      check("D15 回执说清「今天到现在 2 段」", rep1.includes(ON_DAY + " 到现在 (2 段)"), rep1);
+      check("D15 回执带总结正文", rep1.includes("下午修水管") && rep1.includes("主线: 今天忙了不少事。"), rep1);
+      check("D15 回执说清写进了哪里", rep1.includes("已写进笔记的「" + I.SUMMARY_DEFAULT_HEADING + "」一节"), rep1);
+      check("D15 总结确实写进了笔记", v5.files[pd.writer.diaryPath(ON_DAY)].includes("## " + I.SUMMARY_DEFAULT_HEADING) && v5.files[pd.writer.diaryPath(ON_DAY)].includes("上午搬家"));
+      check("D15 「总结」这句话没被记成日记(段数仍是 2)", (await pd.writer.countDay(ON_DAY)) === 2, String(await pd.writer.countDay(ON_DAY)));
+      check("D15 记账: onsummary-ok", String(pd.data.session.summary_last_result).startsWith("onsummary-ok " + ON_DAY), pd.data.session.summary_last_result);
+      check("D15 按需总结**不写** summary_last_date(否则夜里定时会误判成已做过而跳过)", !pd.data.session.summary_last_date, String(pd.data.session.summary_last_date));
+      // 防手抖: 素材没变 → 复用笔记里那份, 不再烧 token
+      const rep2 = await pd.agent._dispatch("总结一下", false, [], null);
+      check("D15 10 分钟内重复说「总结」→ 不再调一次 AI", onCalls === 1, String(onCalls));
+      check("D15 复用笔记里那份, 回执一致", rep2 === rep1, rep2);
+      // 记了新东西 → 照常重算
+      await pd.writer.write("晚上又想起一件事", false, ON_DAY);
+      const rep3 = await pd.agent._dispatch("总结", false, [], null);
+      check("D15 有新记录后重算", onCalls === 2, String(onCalls));
+      check("D15 重算后段数变 3", rep3.includes("(3 段)"), rep3);
+      // 定时那条路关着: 边界到了也不动
+      const onCallsBefore = onCalls;
+      at("2026-09-13T04:00:00+08:00");
+      await pd._summaryTick();
+      check("D15 定时子开关关着 → 边界到了也完全不跑", onCalls === onCallsBefore && !pd.data.session.summary_push_day, JSON.stringify(pd.data.session));
+      // 前置失败: 今天没记东西
+      at("2026-09-12T22:00:00+08:00");
+      const v6 = dv();
+      const pe = await newPlugin({ [SECRET_AI]: "K1", [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+      pe.app.vault = v6;
+      pe.settings.aiApiUrl = "https://x/y";
+      pe.settings.aiModel = "m";
+      pe.settings.aiSummaryEnabled = true;
+      let eCalls = 0;
+      pe.ai = { ready: () => true, summarize: async () => { eCalls++; return "不该被调用"; } };
+      const repEmpty = await pe.agent._dispatch("总结", false, [], null);
+      check("D15 今天还没记 → 直说没得总结, 不调 AI", repEmpty === I.texts3.SUMMARY_EMPTY_REPLY && eCalls === 0, repEmpty);
+      // 前置失败: 主开关没开
+      await pe.writer.write("记一条", false, ON_DAY);
+      pe.settings.aiSummaryEnabled = false;
+      const repOff = await pe.agent._dispatch("总结", false, [], null);
+      check("D15 主开关没开 → 告诉去哪打开", repOff === I.texts3.SUMMARY_OFF_REPLY && eCalls === 0, repOff);
+      check("D15 主开关没开时不写笔记", !(v6.files[pe.writer.diaryPath(ON_DAY)] || "").includes("## " + I.SUMMARY_DEFAULT_HEADING));
+      // 前置失败: AI 没配
+      pe.settings.aiSummaryEnabled = true;
+      pe.ai = { ready: () => false, summarize: async () => { eCalls++; return "不该被调用"; } };
+      const repNoKey = await pe.agent._dispatch("总结", false, [], null);
+      check("D15 AI 没配 → 告诉去哪配, 不调 AI", repNoKey === I.texts3.SUMMARY_NO_KEY_REPLY && eCalls === 0, repNoKey);
+      // AI 调用失败: 说清原因, 不落笔
+      pe.ai = { ready: () => true, summarize: async () => { const e2 = new Error("HTTP 401"); e2.kind = "auth"; throw e2; } };
+      const repFail = await pe.agent._dispatch("总结", false, [], null);
+      check("D15 AI 401 → 回执点明 Key 不对", repFail.includes("AI Key 好像不对") && repFail.includes("在笔记里"), repFail);
+      check("D15 失败不落笔(笔记里没有总结节)", !(v6.files[pe.writer.diaryPath(ON_DAY)] || "").includes("## " + I.SUMMARY_DEFAULT_HEADING));
+      check("D15 失败也记账(诊断用)", String(pe.data.session.summary_last_result).startsWith("onsummary-fail"), pe.data.session.summary_last_result);
+      // 总结拿到了但写不进笔记: 内容先给用户, 同时说清没存下
+      pe.ai = { ready: () => true, summarize: async () => "主线: 拿到了但存不下。" };
+      const realWrite = pe.writer.writeSummary;
+      pe.writer.writeSummary = async () => ({ ok: false, path: "x" });
+      const repWriteFail = await pe.agent._dispatch("总结", false, [], null);
+      pe.writer.writeSummary = realWrite;
+      check("D15 写笔记失败 → 内容照给, 但明说没存下", repWriteFail.includes("拿到了但存不下") && repWriteFail.includes("没能写进笔记"), repWriteFail);
     } finally {
       global.Date = RDate;
       I.setDayStartHour(4);

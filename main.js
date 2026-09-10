@@ -2381,6 +2381,10 @@ const DEFAULT_SETTINGS = {
   // 默认关: 把笔记内容发给第三方接口必须是用户显式打开的开关, 与"零 key 也完整可用"的默认姿态一致
   // (D2 提过的那条代价: 回顾能力需要有 key, 零 key 时降级成"什么都没有", 所以它不能默认改变谁的行为)。
   aiSummaryEnabled: false,
+  // 定时那条路(D15 补, 2026-09-10 谷雨拍板拆开): 主开关只管"AI 总结这个功能能不能用",
+  // 「发一句总结就总结」随主开关生效; 每日定时(边界生成 + 早上推送)是它下面的独立子开关, 默认关——
+  // 按需触发才是多数人想要的, 不想要的定时不该由打开 AI 顺带带来。
+  aiSummaryScheduled: false,
   aiSummaryHeading: "AI 总结",     // 写进笔记的二级节标题(与记录节同名时会被兜底换回默认值)
   aiSummaryPushTime: "08:00",      // 微信推送时刻; 在"逻辑日时钟"上比较, 与每日提醒共用一条逻辑
   // 一天的边界(小时): 凌晨 4 点前记的都算前一天(契约 v1.2)。取代 v0.3.0 前的
@@ -2505,6 +2509,7 @@ const HELP_TEXT = `✍️ 微信随手记 使用指南
 • 撤回 → 删掉刚记的最后一条
 • 晚安 / 结束 → 给今天收个尾 (不发也没关系, 跨天会自动收尾)
 • 在吗 → 看我在不在、今天记了几段
+• 总结 → 用 AI 把今天到现在的记录总结一份 (要先在设置里打开 AI)
 • 叫我XX → 设置/修改你的称呼
 • 记：xx → 把 xx 原样记下 (想把「晚安」这类会被当命令的词记进去时用)
 • 帮助 → 看到这条
@@ -2596,6 +2601,9 @@ const SUMMARY_MAX_OUTPUT_CHARS = 1500;   // 模型跑飞(开始复述原文)时�
 const SUMMARY_PUSH_MAX_CHARS = 900;      // 微信推文上限, 超了截断并指向笔记
 const SUMMARY_MODEL_TIMEOUT_MS = 90000;  // 长文总结比润色慢, 给足; 桌面端 requestUrl 没有应用层超时
 const SUMMARY_DEFAULT_HEADING = "AI 总结";
+// 「总结」命令连说两遍时, 素材段数没变就别再烧一次 token(把笔记里那份读回来复用)。
+// 只防手抖/重发: 过了窗口, 或者期间又记了新东西, 都照常重算。
+const SUMMARY_REPEAT_GUARD_MS = 10 * 60 * 1000;
 
 // 该不该生成当天的总结(纯函数, 表驱动可测)。规则: 开关开着 + AI 配好了 + 逻辑日已翻篇
 // (刚结束那天的记录才攒齐) + 这天没处理过 + 确实读到素材 + 没超重试上限。
@@ -2763,7 +2771,7 @@ function nightSignoffTip(ctx) {
 
 // ── 意图识别(019 intents.py 移植 + 020「误切换吃内容」修复)──────────────
 
-const INTENT = { DIARY: "DIARY", FINALIZE: "FINALIZE", UNDO: "UNDO", HELP: "HELP", CHAT: "CHAT", START_DIARY: "START_DIARY" };
+const INTENT = { DIARY: "DIARY", FINALIZE: "FINALIZE", UNDO: "UNDO", HELP: "HELP", CHAT: "CHAT", START_DIARY: "START_DIARY", SUMMARY: "SUMMARY" };
 
 const MAX_COMMAND_LEN = 15;
 const FINALIZE_KEYWORDS = new Set([
@@ -2804,6 +2812,15 @@ const SEGMENT_SEP_RE = /[,，、;；。.!！?？~～\s]+/;
 // 「记：xx」逃生口: xx 原样落库, 不管它是不是命令词(与「撤回」对称: 一个救误记, 一个救误吞)
 const FORCE_RECORD_RE = /^记[：:]\s*/;
 const HELP_KEYWORDS = new Set(["/help", "help", "帮助", "怎么用", "使用说明", "菜单"]);
+// 「总结」命令(D15 补, 2026-09-10): 按需总结**今天到现在**的记录, 回微信 + 覆盖写笔记的「AI 总结」一节。
+// 与「在吗」同理——这是对 bot 说的话, 不落库。
+// 门槛守全仓库那条标准「可能是内容就不收」: 只认光杆短句(长度闸门 + 精确匹配已经挡住长句),
+// 且**不收养「小结/复盘/回顾/摘要」**——它们更容易是内容(「今天写了个小结」)。想把「总结」这个词本身
+// 记进笔记:「记：总结」。语气词由 normalizeIntent 剥掉, 所以「总结吧」「总结！」自动命中。
+const SUMMARY_KEYWORDS = new Set([
+  "总结", "总结下", "总结一下", "总结今天", "总结一下今天", "总结今天到现在",
+  "今日总结", "今天的总结", "帮我总结", "帮我总结一下", "给我总结", "给我总结一下",
+]);
 // 探活/寒暄词表: 这些是 ping, 不是内容——回状态、不落库(v0.3.0 单模式下的关键闸门)
 const CHAT_GREETING_KEYWORDS = new Set([
   "你好", "您好", "嗨", "hi", "hello", "hihi", "halo", "哈喽", "哈罗",
@@ -2967,6 +2984,7 @@ function matchCommand(forms, norm, opts) {
   if (hitAny(SIGNOFF_KEYWORDS, forms)) return tag({ intent: INTENT.FINALIZE, signoff: true, bedtime: hitAny(BEDTIME_KEYWORDS, forms) });
   if (hitAny(UNDO_KEYWORDS, forms) || forms.some(isUndoPhrase)) return tag({ intent: INTENT.UNDO });
   if (hitAny(HELP_KEYWORDS, forms)) return tag({ intent: INTENT.HELP });
+  if (hitAny(SUMMARY_KEYWORDS, forms)) return tag({ intent: INTENT.SUMMARY });
   if (!o.viaAck && START_DIARY_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY };
   if (!o.viaAck && CONTINUE_KEYWORDS.has(norm)) return { intent: INTENT.START_DIARY, cont: true };
   if ((!o.viaAck || o.allowChat) && hitAny(CHAT_GREETING_KEYWORDS, forms)) return tag({ intent: INTENT.CHAT });
@@ -4574,6 +4592,27 @@ function summaryPushText(day, weekday, text, heading) {
     "\n\n(全文在 " + day + " 笔记的「" + (heading || SUMMARY_DEFAULT_HEADING) + "」一节)";
 }
 
+// ── D15「总结」命令(D15 补, 2026-09-10)──────────────────────────────────
+// 按需触发: 发一句「总结」就总结今天到现在, 不必等每日定时那条路。回执里必须写明
+// "今天到现在 (N 段)"——用户要知道自己拿到的是半天的还是一整天的(定时那条路是整天)。
+function summaryOnDemandReply(day, text, blocks, heading) {
+  return "📖 " + day + " 到现在 (" + blocks + " 段) 的总结:\n\n" + String(text || "").trim() +
+    "\n\n(已写进笔记的「" + (heading || SUMMARY_DEFAULT_HEADING) + "」一节)";
+}
+
+// 「总结」的三种前置失败: 每一条都说清下一步做什么, 不静默、不编内容
+const SUMMARY_NO_KEY_REPLY = "想让我总结, 得先把 AI 配好: Obsidian 设置 → 第三方插件 → WeChat Diary, 填上接口地址、API Key 和模型名 🔧";
+const SUMMARY_OFF_REPLY = "AI 总结还没打开~ 到 Obsidian 设置 → 第三方插件 → WeChat Diary 里打开「AI 总结」, 再说一声「总结」就行 🔧";
+const SUMMARY_EMPTY_REPLY = "今天还没记东西呢~ 先记点, 再说「总结」📖";
+
+function summaryFailReply(kind) {
+  const why = {
+    no_key: "还没配 AI Key", auth: "AI Key 好像不对", balance: "AI 余额用完了",
+    rate_limit: "调用太频繁了", network: "AI 暂时不通", server: "AI 服务异常",
+  }[kind] || "AI 出了点问题";
+  return "⚠️ " + why + ", 这次总结没做出来。你记的内容都好好的在笔记里, 等会儿再说一次「总结」📖";
+}
+
 class DiaryWriter {
   constructor(plugin, ai) { this.plugin = plugin; this.ai = ai; }
 
@@ -5954,6 +5993,44 @@ class DiaryAgent {
     return this._writeAllMedia(images, extras);
   }
 
+  // D15 补「总结」命令: 按需总结**今天到现在**的记录, 不必等每日定时那条路。
+  // 刻意不碰 summary_last_date(那是定时那条路的账): 这里若写它, 当天边界的定时总结会误判成
+  // "已处理过"而跳过——用户白天问过一次, 夜里就再也拿不到那份一整天的总结。
+  async _onDemandSummary() {
+    const plugin = this.plugin;
+    if (!plugin.ai.ready()) return SUMMARY_NO_KEY_REPLY;
+    if (plugin.settings.aiSummaryEnabled !== true) return SUMMARY_OFF_REPLY;
+    const day = logicalTodayStr();
+    const src = await plugin.writer.readSummarySource(day);
+    if (!src) return SUMMARY_EMPTY_REPLY;
+    const s = plugin.data.session;
+    // 防手抖: 10 分钟内、素材段数没变 → 把笔记里那份读回来复用, 不再烧一次 token。
+    // 过了窗口、或期间又记了新东西, 都照常重算(重新生成不该被这个闸门挡住)。
+    let text = "";
+    if (s.onsummary_day === day && s.onsummary_blocks === src.blocks &&
+        Date.now() - (s.onsummary_ts || 0) < SUMMARY_REPEAT_GUARD_MS) {
+      text = await plugin.writer.readSummary(day);
+    }
+    if (!text) {
+      try {
+        text = await plugin.ai.summarize(day, weekdayForDate(day), src.text);
+      } catch (e) {
+        s.summary_last_result = "onsummary-fail " + day + " " + ((e && e.kind) || "other") + " " + new Date().toISOString();
+        return summaryFailReply(e && e.kind);
+      }
+      const meta = { model: plugin.settings.aiModel, time: todayStr() + " " + hhmmStr(), blocks: src.blocks };
+      const w = await plugin.writer.writeSummary(day, text, meta);
+      if (!w.ok) {
+        // 总结拿到了但没存下: 先把内容给用户, 同时说清笔记里没有——不能让他以为存好了
+        s.summary_last_result = "onsummary-writefail " + day + " " + new Date().toISOString();
+        return text + "\n\n(⚠️ 这份没能写进笔记, 只有上面对话里有)";
+      }
+      s.onsummary_day = day; s.onsummary_ts = Date.now(); s.onsummary_blocks = src.blocks;
+      s.summary_last_result = "onsummary-ok " + day + " " + new Date().toISOString();
+    }
+    return summaryOnDemandReply(day, text, src.blocks, plugin.writer._summaryHeading());
+  }
+
   // 主业务路由(v0.3.0 单模式: 发什么记什么, 命令词是唯一例外; 闲聊分支整体退役)
   async _handle(text, isVoice, cross, det) {
     det = det || detectIntent(text);
@@ -5963,6 +6040,9 @@ class DiaryAgent {
     // 探活(在吗/hello/测试…): 回状态, 不落库。用户在 ping"它还在吗"——尊重这个机制,
     // 别把它记进笔记。bot 不在线时本来就没人回, 有回复即是答案。
     if (det.intent === INTENT.CHAT) return pingReply(await this.writer.countDay());
+
+    // 「总结」(D15 补): 按需总结今天到现在——回微信 + 覆盖写笔记的「AI 总结」一节, 不落库
+    if (det.intent === INTENT.SUMMARY) return await this._onDemandSummary();
 
     if (det.intent === INTENT.UNDO) {
       const r = await this.writer.undoLastBlock();
@@ -6927,10 +7007,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(containerEl).setName("AI 每日总结").setHeading();
+    new Setting(containerEl).setName("AI 总结").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
-      text: "默认关闭。打开后, 每天跨过「一天的边界」(默认凌晨 4 点)时, 插件把刚结束那天的微信记录交给下面的接口, 总结写进当天笔记的「AI 总结」一节, 到点(默认 08:00)再推一次微信。只有你发给 bot 的内容会被发送, 用户自己在每日笔记里写的东西不会外发。",
+      text: "默认关闭。打开后, 在微信里发一句「总结」, 我就把今天到现在的记录总结一份发回给你, 并写进当天笔记的「AI 总结」一节。想每天自动总结, 再打开下面的「每日定时总结」。只有你发给 bot 的内容会被发送, 用户自己在每日笔记里写的东西不会外发。",
     });
 
     new Setting(containerEl)
@@ -6956,8 +7036,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
         .onChange(async (v) => { plugin.settings.aiModel = v.trim(); await plugin.persist(); }));
 
     new Setting(containerEl)
-      .setName("启用每日总结")
-      .setDesc("把当天的记录发给上面配置的接口。三项没配全时打开也不会有任何请求, 只会在日志里说一声。")
+      .setName("启用 AI 总结")
+      .setDesc("打开后可以在微信里发「总结」按需总结今天。接口三项没配全时打开也不会有任何请求, 只会提示你。")
       .addToggle((t) => t.setValue(plugin.settings.aiSummaryEnabled === true)
         .onChange(async (v) => {
           if (v && !(plugin.settings.aiApiUrl && plugin.settings.aiModel && plugin.getAiKey())) {
@@ -6966,6 +7046,12 @@ class WechatDiarySettingTab extends PluginSettingTab {
           plugin.settings.aiSummaryEnabled = v;
           await plugin.persist();
         }));
+
+    new Setting(containerEl)
+      .setName("每日定时总结")
+      .setDesc("默认关闭。打开后每天跨过「一天的边界」(默认凌晨 4 点)时自动总结刚结束的那一天, 到点(默认 08:00)再推一次微信。只在电脑开着 Obsidian 时跑, 那一刻没开就顺延到下次打开补做。")
+      .addToggle((t) => t.setValue(plugin.settings.aiSummaryScheduled === true)
+        .onChange(async (v) => { plugin.settings.aiSummaryScheduled = v; await plugin.persist(); }));
 
     new Setting(containerEl)
       .setName("总结写入的节标题")
@@ -6989,7 +7075,7 @@ class WechatDiarySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("微信推送时间")
-      .setDesc("总结在边界时刻就写好了, 到点才推微信——默认 08:00, 免得凌晨震手机。24 小时制, 如 08:00。")
+      .setDesc("「每日定时总结」推微信的时刻——总结在边界时刻就写好了, 到点才推, 默认 08:00, 免得凌晨震手机。24 小时制, 如 08:00。")
       .addText((t) => {
         let lastValid = plugin.settings.aiSummaryPushTime || "08:00";
         t.setPlaceholder("08:00").setValue(lastValid)
@@ -7051,6 +7137,10 @@ const DEFAULT_DATA = () => ({
     summary_last_date: "", summary_attempts: 0, summary_attempt_day: "",
     summary_push_day: "", summary_push_attempts: 0, summary_pending_delivery: "",
     summary_last_result: "",
+    // D15 补「总结」命令: onsummary_*=最近一次按需总结的日子/时刻/素材段数, 用来防手抖重复调用
+    // (素材段数没变就复用笔记里那份, 不再烧一次 token)。刻意与 summary_last_date 分开记:
+    // 那是定时那条路的账, 按需总结若去动它, 当天边界的定时总结会误判成"已处理过"而跳过。
+    onsummary_day: "", onsummary_ts: 0, onsummary_blocks: 0,
   },
 });
 
@@ -7523,12 +7613,15 @@ class WechatDiaryPlugin extends Plugin {
   async _summaryTick() {
     if (this._summaryBusy) return;
     const s = this.data.session;
-    if (!this.settings.aiSummaryEnabled) {
-      // 关掉开关 = 连待推送的也一起放弃(用户明确表示不想要了)。summary_last_date 保留:
+    // D15: 定时那条路要主开关 + 定时子开关都开。只发一句「总结」(按需触发)不看 aiSummaryScheduled,
+    // 它只看主开关——两件事的开关拆开正是这一轮的拍板。
+    const scheduled = this.settings.aiSummaryEnabled === true && this.settings.aiSummaryScheduled === true;
+    if (!scheduled) {
+      // 关掉定时 = 连待推送的也一起放弃(用户明确表示不想要了)。summary_last_date 保留:
       // 再打开时不该补跑陈年旧账, 只从下一个边界开始。
       if (s.summary_push_day || s.summary_pending_delivery) {
         s.summary_push_day = ""; s.summary_push_attempts = 0; s.summary_pending_delivery = "";
-        s.summary_last_result = "disabled " + new Date().toISOString();
+        s.summary_last_result = "scheduled-off " + new Date().toISOString();
         await this.persist();
       }
       return;
@@ -7861,6 +7954,9 @@ WechatDiaryPlugin.__internals = {
   logicalTimeReached, logicalDayFlipped, summaryDue, summaryPushDue,
   summarySourceRegion, cleanSummarySource, sanitizeSummaryOutput, escapeSummaryHeaderLines,
   splitSummarySection, joinSummarySection, buildSummaryBody, summaryPushText, SUMMARY_PROMPT, SUMMARY_DEFAULT_HEADING,
+  // D15 补「总结」命令
+  SUMMARY_KEYWORDS, summaryOnDemandReply, summaryFailReply,
+  texts3: { SUMMARY_NO_KEY_REPLY, SUMMARY_OFF_REPLY, SUMMARY_EMPTY_REPLY },
   // #15 路径层与共用文件模式
   renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
   normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,

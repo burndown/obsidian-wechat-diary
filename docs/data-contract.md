@@ -220,6 +220,8 @@ _(今日封存于 23:02)_
 
 - 节标题默认 `AI 总结`（`settings.aiSummaryHeading` 可改, 级别固定二级）。
 - **固定放在文件末尾**, 由插件独占; 记录区（全部 `**HH:MM**` 段与封存行）永远在它之前。
+- **两种产生方式, 同一节同一格式**: 每日定时（`settings.aiSummaryScheduled`, 默认关）总结刚结束的那一天;
+  在微信里发「总结」则按需总结当天到现在（只受主开关 `settings.aiSummaryEnabled` 管）。二者都覆盖重写这一节。
 - 内容形如:
 
 ```markdown
