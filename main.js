@@ -6183,12 +6183,65 @@ class ConfirmModal extends Modal {
 class WechatDiarySettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
+  // ── D18 第 5 步: 设置页编辑的是「当前账户」, 不是 plugin.settings ──────────────
+  // installSettingsShim 把 plugin.settings 上那 17 个字段钉在**账户 #1** 上。设置页若继续用
+  // plugin.settings, 选中账户 #2 时改设置会落到账户 #1(两个号串配置)。所以一律经这几个帮手取当前账户:
+  //   _aid()    当前账户 id
+  //   _acct()   当前账户对象
+  //   _writer() 当前账户的 DiaryWriter(不是兼容别名 plugin.writer —— 那只指账户 #1)
+  //   _d()      当前账户的 diary(读写目标)
+  //   _view()   把当前账户的 diary 解析到一份 settings 形状的浅拷贝上, 喂给吃 settings 的纯函数
+  _aid() { return this.plugin.activeAccountId(); }
+  _acct() { return this.plugin.activeAccount() || this.plugin.firstAccount(); }
+  _writer() {
+    const id = this._aid();
+    return (this.plugin.writers && this.plugin.writers[id]) || this.plugin.writer;
+  }
+  _d() {
+    const a = this._acct();
+    return (a && a.diary) || this.plugin.settings;
+  }
+  _view() {
+    const w = this._writer();
+    return (w && typeof w._settingsView === "function") ? w._settingsView() : this.plugin.settings;
+  }
+
+  // 两层同树校验: 拿"候选 diary"(可能是还没落盘的草稿)去比除了 id 之外的账户。
+  // 返回 null(放行)或 { error, conflictId }。设置页所有会动"这棵树在哪"的入口都走它。
+  _treeConflictFor(id, candidate) {
+    const others = (this.plugin.data.accounts || [])
+      .filter((a) => a && a.id !== id)
+      .map((a) => ({ id: a.id, label: a.label, diary: { diaryFolder: this.plugin._st("diaryFolder", a.id), pathFormat: this.plugin._st("pathFormat", a.id) } }));
+    const r = validateAccountTree(candidate, others, { momentLib: moment, today: logicalTodayStr() });
+    return r.ok ? null : r;
+  }
+  _treeConflict(candidate) { return this._treeConflictFor(this._aid(), candidate); }
+
+  // 删除账户的二次确认。提示里必须写明两件事: ① vault 里已经写好的文件一个都不动
+  // (与「撤回只删引用、不删附件」同一条纪律); ② 删的是最后一个时会立刻补一个全新的空账户
+  // (= 重置为未绑定), 用户得知道要重新扫码才能再记。
+  _confirmDeleteAccount(acct) {
+    const plugin = this.plugin;
+    const last = (plugin.data.accounts || []).length <= 1;
+    const text = "删除账户「" + (acct.label || acct.id) + "」?\n" +
+      "· 只删这个账户的登录凭据、运行状态和它自己的日记设置; vault 里已经写好的日记和附件一个都不会动。\n" +
+      (last
+        ? "· 这是最后一个账户: 删完会立刻补一个全新的空账户(等价于「重置为未绑定」), 想再记要重新扫码。"
+        : "· 其它账户不受影响, 它们的历史文件也不会动。");
+    new ConfirmModal(this.app, "删除账户?", text, "删除", async () => {
+      await plugin.deleteAccount(acct.id);
+      this.display();
+    }).open();
+  }
+
   // ── #15 设置页辅助 ──
   // 外来文件提示(B1): 开关关着、路径却指向不是插件建的文件(多半是用户的每日笔记) → 确认框 + 「改回默认」
   async _foreignCheck() {
     const plugin = this.plugin;
-    if (plugin.settings.sharedDailyNote) return;
-    const path = plugin.writer.diaryPath(logicalTodayStr());
+    const st = this._d();
+    if (st.sharedDailyNote) return;
+    const w = this._writer();
+    const path = w.diaryPath(logicalTodayStr());
     const f = plugin.app.vault.getFileByPath(path);
     if (!f) return;
     let content = "";
@@ -6196,10 +6249,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
     if (!isForeignFile(content)) return;
     // 文件里有我们的节 = 共用模式自己写的每日笔记, 不是外来文件——不能提供「改回默认」
     // (谷雨实测: 关开关时点了改回默认, 路径格式被改掉, 之后的文件散在两个层级)
-    const loc = locateSection(content, plugin.writer._heading());
+    const loc = locateSection(content, w._heading());
     if (loc) {
       const m = new ConfirmModal(this.app, "已关闭「写进已有的每日笔记」",
-        "今天的文件「" + path + "」是共用模式写的每日笔记。关掉后, 微信内容会继续追加到这个文件的末尾(不再归入「" + plugin.writer._heading() + "」一节), 「撤回」「在吗」只认微信记的部分。\n想让内容写回插件自己的文件夹, 改「日记」区的 日记文件夹 / 路径格式。",
+        "今天的文件「" + path + "」是共用模式写的每日笔记。关掉后, 微信内容会继续追加到这个文件的末尾(不再归入「" + w._heading() + "」一节), 「撤回」「在吗」只认微信记的部分。\n想让内容写回插件自己的文件夹, 改「日记」区的 日记文件夹 / 路径格式。",
         "知道了", async () => {});
       m.hideCancel = true;
       m.open();
@@ -6210,15 +6263,15 @@ class WechatDiarySettingTab extends PluginSettingTab {
       ? { diaryFolder: before.diaryFolder, pathFormat: before.pathFormat }
       : { diaryFolder: DEFAULT_SETTINGS.diaryFolder, pathFormat: DEFAULT_SETTINGS.pathFormat };
     const changes = [];
-    if ((plugin.settings.diaryFolder || "日记") !== (target.diaryFolder || "日记")) changes.push("日记文件夹「" + (plugin.settings.diaryFolder || "日记") + "」→「" + (target.diaryFolder || "日记") + "」");
-    if ((plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat) !== (target.pathFormat || DEFAULT_SETTINGS.pathFormat)) changes.push("路径格式「" + (plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」→「" + (target.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」");
+    if ((st.diaryFolder || "日记") !== (target.diaryFolder || "日记")) changes.push("日记文件夹「" + (st.diaryFolder || "日记") + "」→「" + (target.diaryFolder || "日记") + "」");
+    if ((st.pathFormat || DEFAULT_SETTINGS.pathFormat) !== (target.pathFormat || DEFAULT_SETTINGS.pathFormat)) changes.push("路径格式「" + (st.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」→「" + (target.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」");
     if (!changes.length) return;
     new ConfirmModal(this.app, "路径指向的不是插件建的文件",
       "「" + path + "」不是插件建的(多半是你的每日笔记)。开关关着时插件会往里追加内容, 但只数、只撤微信记的那部分。\n要改回" + (before ? "导入前的路径" : "默认路径") + "吗? 会改: " + changes.join("; "),
       before ? "改回导入前" : "改回默认",
       async () => {
-        if (before) { plugin.settings.diaryFolder = before.diaryFolder; plugin.settings.pathFormat = before.pathFormat; plugin.settings.templatePath = before.templatePath; }
-        else { plugin.settings.diaryFolder = DEFAULT_SETTINGS.diaryFolder; plugin.settings.pathFormat = DEFAULT_SETTINGS.pathFormat; }
+        if (before) { st.diaryFolder = before.diaryFolder; st.pathFormat = before.pathFormat; st.templatePath = before.templatePath; }
+        else { st.diaryFolder = DEFAULT_SETTINGS.diaryFolder; st.pathFormat = DEFAULT_SETTINGS.pathFormat; }
         plugin._beforeImport = null;
         await plugin.persist();
         this.display();
@@ -6228,8 +6281,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
   // 节标题撞用户模板里已有的标题: 今天的文件里该标题下已有内容 → 确认; 取消则回退(onCancel 由调用方给)
   async _headingCollisionCheck(onCancel) {
     const plugin = this.plugin;
-    if (!plugin.settings.sharedDailyNote) return;
-    const w = plugin.writer;
+    if (!this._d().sharedDailyNote) return;
+    const w = this._writer();
     const f = plugin.app.vault.getFileByPath(w.diaryPath(logicalTodayStr()));
     if (!f) return;
     let content = "";
@@ -6260,13 +6313,13 @@ class WechatDiarySettingTab extends PluginSettingTab {
     const plugin = this.plugin;
     const found = this._readDailyNotesSettings();
     if (!found) {
-      new Notice("没找到每日笔记插件的设置(核心「每日笔记」或 Periodic Notes 都没启用)。请在「日记」区选好你每日笔记的文件夹和路径格式, 否则微信内容会写到「" + (plugin.settings.diaryFolder || "日记") + "」下、和你的每日笔记不在一起", 12000);
+      new Notice("没找到每日笔记插件的设置(核心「每日笔记」或 Periodic Notes 都没启用)。请在「日记」区选好你每日笔记的文件夹和路径格式, 否则微信内容会写到「" + (this._d().diaryFolder || "日记") + "」下、和你的每日笔记不在一起", 12000);
       return;
     }
     const dnFolder = String(found.src.folder || "").trim() || "/";
     const dnFormat = String(found.src.format || "").trim() || "YYYY-MM-DD";
-    const curFolder = String(plugin.settings.diaryFolder || "日记");
-    const curFormat = plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat;
+    const curFolder = String(this._d().diaryFolder || "日记");
+    const curFormat = this._d().pathFormat || DEFAULT_SETTINGS.pathFormat;
     const same = normalizePath(dnFolder === "/" ? "/" : dnFolder) === normalizePath(curFolder === "/" ? "/" : curFolder) && dnFormat === curFormat;
     if (same) return;
     this._importDailyNotes(); // 已自带差异清单 + 确认框
@@ -6291,13 +6344,24 @@ class WechatDiarySettingTab extends PluginSettingTab {
       else if (app.vault.getFileByPath(normalizePath(tplRaw))) tplPath = normalizePath(tplRaw);
     }
     const v = validatePathFormat(format, { requireDaily: true, momentLib: moment });
-    const cur = plugin.settings;
+    const cur = this._d();
     const text = "将把下面三项覆盖为" + name + "的设置:\n" +
       "· 日记文件夹: " + folder + (folder === "/" ? " (库根目录)" : "") + "\n" +
       "· 路径格式: " + format + (v.ok ? "" : " (⚠️ " + v.error + ", 这项不会导入)") + "\n" +
       "· 模板: " + (tplPath || (tplRaw ? "没找到「" + tplRaw + "」, 请自己选" : "无")) + "\n\n" +
       "当前值: 日记文件夹「" + (cur.diaryFolder || "日记") + "」, 路径格式「" + (cur.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」, 模板「" + (cur.templatePath || "无") + "」";
     new ConfirmModal(this.app, "从" + name + "设置导入", text, "导入", async () => {
+      // 同树校验: 导入的是"位置 + 格式"这一对, 撞上别的账户就整项不导入(模板与位置无关, 仍可导)
+      const cand = { diaryFolder: folder, pathFormat: v.ok ? v.value : (cur.pathFormat || DEFAULT_SETTINGS.pathFormat) };
+      const cf = this._treeConflict(cand);
+      if (cf) {
+        new Notice("位置没导入: " + cf.error);
+        cur.templatePath = tplPath;
+        if (tplRaw && !tplPath) new Notice("模板文件没找到, 请自己选");
+        await plugin.persist();
+        this.display();
+        return;
+      }
       plugin._beforeImport = { diaryFolder: cur.diaryFolder, pathFormat: cur.pathFormat, templatePath: cur.templatePath };
       cur.diaryFolder = folder;
       if (v.ok) cur.pathFormat = v.value; else new Notice("路径格式没导入: " + v.error);
@@ -6333,11 +6397,15 @@ class WechatDiarySettingTab extends PluginSettingTab {
       if (kind === "folder" && opts.allowRoot) list.unshift("/");
       return list;
     };
+    // onPick 返回 false = 这次选择被拒(同树校验失败): 输入框回退到上一个合法值、且不落盘。
+    // 不回退的话页面显示的是"没被接受的值", data.json 里却是旧值 —— 比报错更难查。
     const commit = async (v) => {
       if (v === saved) return;
-      saved = v;
+      const prev = saved;
       t.setValue(v);
-      await opts.onPick(v);
+      const ok = await opts.onPick(v);
+      if (ok === false) { t.setValue(prev); return; }
+      saved = v;
     };
     t.setValue(saved);
     t.inputEl.addEventListener("input", () => { typed = true; });
@@ -6422,34 +6490,94 @@ class WechatDiarySettingTab extends PluginSettingTab {
     containerEl.empty();
     const plugin = this.plugin;
 
-    new Setting(containerEl).setName("微信").setHeading();
-
-    const state = plugin.bindState();
-    const bindDesc = state === "bound"
-      ? "已绑定 (" + String(plugin.data.ilink.userId).slice(0, 18) + "…)。消息管道在 Obsidian 打开期间运行。"
-      : state === "half"
-        ? "待认领: 本机凭据还在, 但主人身份丢了(重装插件或换设备会这样)。给微信 bot 发条消息, 这里会弹确认。"
-        : "未绑定。扫码后, 对微信 bot 说话就能写进库里。";
-    new Setting(containerEl)
-      .setName("绑定状态")
-      .setDesc(bindDesc)
-      .addButton((b) => b.setButtonText(state === "none" ? "扫码绑定" : "重新扫码").setCta()
-        .onClick(() => new QrLoginModal(this.app, plugin).open()))
-      .addButton((b) => {
+    // ── 微信账户(D18 第 5 步)────────────────────────────────────────────────
+    // 一行一个账户: 名字(可改) / 绑定状态 / 重新扫码 / 解除绑定 / 删除; 紧接着是它自己的日记文件夹。
+    // 点行标题把该账户设为"当前账户", 下面「日记」「附件」…几组设置跟着它走(activeAccount 只影响 UI)。
+    new Setting(containerEl).setName("微信账户").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "每个微信账户有自己的一套日记设置、自己的提醒与剪藏, 互不影响。点带 ▸ 的行标题切换正在编辑的账户。",
+    });
+    const accounts = plugin.data.accounts || [];
+    for (const acct of accounts) {
+      let labelTimer = null;   // 每个账户一个: 共用的话快改两个账户名时前一个去抖会被后一个清掉
+      const isActive = acct.id === plugin.activeAccountId();
+      const state = plugin.bindState(acct.id);
+      const uid = String((acct.ilink && acct.ilink.userId) || "");
+      const bindDesc = state === "bound"
+        ? "已绑定 (" + uid.slice(0, 18) + "…)。消息管道在 Obsidian 打开期间运行。"
+        : state === "half"
+          ? "待认领: 本机凭据还在, 但主人身份丢了(重装插件或换设备会这样)。给微信 bot 发条消息, 这里会弹确认。"
+          : "未绑定。扫码后, 对微信 bot 说话就能写进库里。";
+      const row = new Setting(containerEl)
+        .setName((isActive ? "▸ " : "") + (acct.label || acct.id) + (isActive ? "（正在编辑）" : ""))
+        .setDesc(bindDesc);
+      // 账户名: 用来区分两个号, 也是"添加账户"时新文件夹的默认名
+      row.addText((t) => t.setPlaceholder("账户名, 如 工作号").setValue(acct.label || "")
+        .onChange((v) => {
+          this._clearLater(labelTimer);
+          labelTimer = this._later(async () => {
+            const name = (v || "").trim();
+            if (!name || name === acct.label) return;
+            acct.label = name;
+            await plugin.persist();
+            this.display();   // 行标题要跟着变(改名是低频操作, 重画可以接受)
+          }, 500);
+        }));
+      row.addButton((b) => b.setButtonText(state === "none" ? "扫码绑定" : "重新扫码").setCta()
+        .onClick(() => new QrLoginModal(this.app, plugin, acct.id).open()));
+      row.addButton((b) => {
         b.setButtonText(state === "half" ? "清除残留凭据" : "解除绑定").onClick(() => {
           new ConfirmUnbindModal(this.app, state, async (keepToken) => {
-            await plugin.unbind(keepToken);
+            await plugin.unbindAccount(acct.id, keepToken);
             this.display();
           }).open();
         });
-        // 只要还有任何一半残留就必须能清 —— 这个按钮在半绑定时被禁用, 正是 v0.2.1
-        // 之前用户被锁死的直接原因: 清不掉残留 token, 重新扫码就永远被顶回来。
+        // 只要还有任何一半残留就必须能清 —— 见 v0.2.1 那场锁死故障, 与旧的全局解绑同一个教训
         if (state === "none") b.setDisabled(true);
       });
+      row.addButton((b) => b.setButtonText("删除").setWarning().onClick(() => this._confirmDeleteAccount(acct)));
+      // 点这一行(点在控件以外的区域) → 设为当前账户并重画。控件上的点击不算:
+      // 输入框里点一下就 display() 会把焦点连同正在打的字一起丢掉。
+      if (!isActive && row.settingEl && typeof row.settingEl.addEventListener === "function") {
+        row.settingEl.addEventListener("click", (ev) => {
+          const tgt = ev && ev.target;
+          if (tgt && typeof tgt.closest === "function" && tgt.closest("input, textarea, select, button, a")) return;
+          plugin.data.activeAccount = acct.id;
+          plugin.persist();
+          this.display();
+        });
+      }
+      // 该账户自己的日记根(既有文件夹选择器; 指向**它自己的** diary.folder, 与"当前账户"无关)
+      new Setting(containerEl)
+        .setName("「" + (acct.label || acct.id) + "」的日记文件夹")
+        .setDesc("这个账户的日记写到库里哪个文件夹。点进去选(打字过滤); 要用新文件夹, 先在 Obsidian 文件列表里建好。两个账户不能指向同一棵树, 撞了不保存。")
+        .addText((t) => this._pathSuggest(t, {
+          kind: "folder", allowRoot: true, value: acct.diary.diaryFolder || "日记",
+          onPick: async (v) => {
+            const cand = { diaryFolder: v || "日记", pathFormat: plugin._st("pathFormat", acct.id) };
+            const r = this._treeConflictFor(acct.id, cand);
+            if (r) { new Notice(r.error); return false; }   // false = 不落盘、输入框回退
+            acct.diary.diaryFolder = v || "日记";
+            await plugin.persist();
+            this.display();
+            return true;
+          },
+        }));
+    }
+    new Setting(containerEl)
+      .setName("添加账户")
+      .setDesc("上限 " + MAX_ACCOUNTS + " 个(每个账户一条并发长轮询)。新账户继承上一个账户的日记设置, 文件夹会自动让开; 建好后接着扫码绑定。")
+      .addButton((b) => b.setButtonText("添加账户").onClick(async () => {
+        const acct = await plugin.addAccount();
+        if (!acct) return;                                        // 到上限了, addAccount 已经提示过
+        this.display();
+        new QrLoginModal(this.app, plugin, acct.id).open();       // 顺手把"接着扫码绑定"接上
+      }));
 
     // ── 日记 ──────────────────────────────────────────────────────────────
     new Setting(containerEl).setName("日记").setHeading();
-    const st = plugin.settings;
+    const st = this._d();   // D18: 写的是"当前账户"的 diary, 不是被垫片钉在账户 #1 上的 plugin.settings
     const todayD = logicalTodayStr();
     let fmtPreview = null; // 路径格式的预览行(下面声明); 改日记文件夹时也要刷新它
 
@@ -6458,7 +6586,16 @@ class WechatDiarySettingTab extends PluginSettingTab {
       .setDesc("日记的根目录。点进去选一个库里的文件夹(打字可以过滤)。文件放在根目录下的哪里由下面的「日记文件路径格式」决定。要用新文件夹, 先在 Obsidian 文件列表里建好再来选。")
       .addText((t) => this._pathSuggest(t, {
         kind: "folder", allowRoot: true, value: st.diaryFolder || "日记",
-        onPick: async (v) => { st.diaryFolder = v || "日记"; await plugin.persist(); if (fmtPreview) fmtPreview(); await this._foreignCheck(); },
+        onPick: async (v) => {
+          // 同树校验: 与别的账户撞了就不落盘、输入框回退(与路径格式预览行"不合法就不保存"同一种做法)
+          const r = this._treeConflict({ diaryFolder: v || "日记", pathFormat: st.pathFormat || DEFAULT_SETTINGS.pathFormat });
+          if (r) { new Notice(r.error); return false; }
+          st.diaryFolder = v || "日记";
+          await plugin.persist();
+          if (fmtPreview) fmtPreview();
+          await this._foreignCheck();
+          return true;
+        },
       }));
 
     // 路径格式: 三个预设 + 自定义(选了自定义才露出输入框)
@@ -6478,20 +6615,28 @@ class WechatDiarySettingTab extends PluginSettingTab {
     fmtPreview = this._previewLine(fmtSetting, () => {
       const v = validatePathFormat(fmtDraft, { requireDaily: true, momentLib: moment });
       if (!v.ok) return { ok: false, text: v.error + " (没有保存)" };
-      return { ok: true, text: "今天会写到: " + plugin.writer._join(plugin.writer._root(), renderPath(v.value, todayD, moment) + ".md") };
+      // 两层同树校验的第二层就在这: 格式合法, 但按它渲染出的今天会和别的账户撞进同一个文件
+      const cf = this._treeConflict({ diaryFolder: st.diaryFolder, pathFormat: v.value });
+      if (cf) return { ok: false, text: cf.error + " (没有保存)" };
+      const w = this._writer();
+      return { ok: true, text: "今天会写到: " + w._join(w._root(), renderPath(v.value, todayD, moment) + ".md") };
     });
     fmtSetting.addDropdown((d) => {
       const opts = Object.assign({}, PRESETS, { custom: "自定义… (任意 moment 格式, 如 YYYY/[W]ww/YYYY-MM-DD)" });
       d.addOptions(opts).setValue(fmtIsPreset ? curFmt : "custom")
         .onChange(async (v) => {
-          if (v === "custom") { st._fmtCustom = true; this.display(); return; }
-          st._fmtCustom = false;
-          if (v !== st.pathFormat) { st.pathFormat = v; await plugin.persist(); await this._foreignCheck(); }
+          if (v === "custom") { plugin.settings._fmtCustom = true; this.display(); return; }
+          plugin.settings._fmtCustom = false;
+          if (v !== st.pathFormat) {
+            const cf = this._treeConflict({ diaryFolder: st.diaryFolder, pathFormat: v });
+            if (cf) new Notice(cf.error + " (没有切换)");
+            else { st.pathFormat = v; await plugin.persist(); await this._foreignCheck(); }
+          }
           fmtDraft = v;
           this.display();
         });
     });
-    if (!fmtIsPreset || st._fmtCustom) {
+    if (!fmtIsPreset || plugin.settings._fmtCustom) {
       const customSetting = new Setting(containerEl)
         .setName("自定义路径格式")
         .setDesc("相对日记文件夹; 与 Obsidian 每日笔记「日期格式」同一套写法(moment)。英文字母会被当成日期代码, 固定的文件夹名要放在方括号里, 如 [daily]/YYYY/MM/YYYY-MM-DD。");
@@ -6501,7 +6646,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
           this._clearLater(fmtTimer);
           fmtTimer = this._later(async () => {
             const r = validatePathFormat(fmtDraft, { requireDaily: true, momentLib: moment });
-            if (r.ok && r.value !== st.pathFormat) { st.pathFormat = r.value; await plugin.persist(); await this._foreignCheck(); }
+            const cf = r.ok ? this._treeConflict({ diaryFolder: st.diaryFolder, pathFormat: r.value }) : null;
+            if (r.ok && !cf && r.value !== st.pathFormat) { st.pathFormat = r.value; await plugin.persist(); await this._foreignCheck(); }
             fmtPreview();
           }, 400);
         }));
@@ -6511,24 +6657,24 @@ class WechatDiarySettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("自动提取公众号正文")
       .setDesc("默认关闭。开启后，微信里发 mp.weixin.qq.com 公众号链接时，抓取标题、正文和正文图片保存为 Markdown；今日日记保留原句并另起一行放剪藏入口。")
-      .addToggle((t) => t.setValue(plugin.settings.webClipEnabled === true)
-        .onChange(async (v) => { plugin.settings.webClipEnabled = v; await plugin.persist(); }));
+      .addToggle((t) => t.setValue(st.webClipEnabled === true)
+        .onChange(async (v) => { st.webClipEnabled = v; await plugin.persist(); }));
     new Setting(containerEl)
       .setName("其他网站的链接也提取正文")
       .setDesc("默认关闭。关闭时普通网址只按原句记进日记，不访问网页；开启后才尝试剪藏其它公开网站。")
-      .addToggle((t) => t.setValue(plugin.settings.webClipOtherSites === true)
-        .onChange(async (v) => { plugin.settings.webClipOtherSites = v; await plugin.persist(); }));
-    const defaultClipFolder = defaultWebClipFolder(plugin.settings);
+      .addToggle((t) => t.setValue(st.webClipOtherSites === true)
+        .onChange(async (v) => { st.webClipOtherSites = v; await plugin.persist(); }));
+    const defaultClipFolder = defaultWebClipFolder(this._view());
     new Setting(containerEl)
       .setName("剪藏文件夹")
       .setDesc("默认跟随日记文件夹，放在 <日记文件夹>/剪藏；留空即可恢复跟随")
-      .addText((t) => t.setPlaceholder(defaultClipFolder).setValue(plugin.settings.webClipFolder || defaultClipFolder)
-        .onChange(async (v) => { plugin.settings.webClipFolder = (v || "").trim(); await plugin.persist(); }));
+      .addText((t) => t.setPlaceholder(defaultClipFolder).setValue(st.webClipFolder || defaultClipFolder)
+        .onChange(async (v) => { st.webClipFolder = (v || "").trim(); await plugin.persist(); }));
     new Setting(containerEl)
       .setName("保存正文图片")
       .setDesc("下载正文区域内的图片到剪藏文件夹 assets 目录，并在 Markdown 中使用本地 Obsidian 图片内链。单张图片上限 15MB。")
-      .addToggle((t) => t.setValue(plugin.settings.webClipSaveImages !== false)
-        .onChange(async (v) => { plugin.settings.webClipSaveImages = v; await plugin.persist(); }));
+      .addToggle((t) => t.setValue(st.webClipSaveImages !== false)
+        .onChange(async (v) => { st.webClipSaveImages = v; await plugin.persist(); }));
     new Setting(containerEl)
       .setName("每篇最多图片数")
       .setDesc("范围 1–100，默认 30；超出的图片会保留原图链接和失败原因")
@@ -6536,10 +6682,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
         t.inputEl.type = "number";
         t.inputEl.min = "1";
         t.inputEl.max = String(WEB_CLIP_HARD_MAX_IMAGES);
-        t.setValue(String(webClipMaxImages(plugin.settings))).onChange(async (v) => {
+        t.setValue(String(webClipMaxImages(this._view()))).onChange(async (v) => {
           const n = Math.floor(Number(v));
           if (!Number.isFinite(n) || n < 1 || n > WEB_CLIP_HARD_MAX_IMAGES) return;
-          plugin.settings.webClipMaxImages = n;
+          st.webClipMaxImages = n;
           await plugin.persist();
         });
       });
@@ -6550,10 +6696,10 @@ class WechatDiarySettingTab extends PluginSettingTab {
         t.inputEl.type = "number";
         t.inputEl.min = String(WEB_CLIP_MIN_TOTAL_IMAGE_MB);
         t.inputEl.max = String(WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB);
-        t.setValue(String(Math.floor(webClipMaxTotalImageBytes(plugin.settings) / 1024 / 1024))).onChange(async (v) => {
+        t.setValue(String(Math.floor(webClipMaxTotalImageBytes(this._view()) / 1024 / 1024))).onChange(async (v) => {
           const n = Math.floor(Number(v));
           if (!Number.isFinite(n) || n < WEB_CLIP_MIN_TOTAL_IMAGE_MB || n > WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB) return;
-          plugin.settings.webClipMaxTotalImageMb = n;
+          st.webClipMaxTotalImageMb = n;
           await plugin.persist();
         });
       });
@@ -6634,15 +6780,16 @@ class WechatDiarySettingTab extends PluginSettingTab {
         .setName("从每日笔记设置导入")
         .setDesc("读取 Obsidian「每日笔记」(或 Periodic Notes)的文件夹、日期格式、模板, 填进日记文件夹 / 路径格式 / 模板三项。会先让你确认。")
         .addButton((b) => b.setButtonText("导入").onClick(() => this._importDailyNotes()));
-      const dsh = Number(st.dayStartHour);
+      // 「一天从几点开始」是全局的(模块级 _dayStartHour, docs/18 §2 明确本轮不下放), 不能跟着账户
+      const dsh = Number(plugin.settings.dayStartHour);
       const dshVal = Number.isInteger(dsh) && dsh >= 0 && dsh <= 12 ? dsh : 4;
       const hourOpts = {};
       for (let h = 0; h <= 12; h++) hourOpts[String(h)] = h === 0 ? "0 点(和每日笔记一样, 零点算新的一天)" : h + " 点";
       new Setting(containerEl)
         .setName("一天从几点开始")
-        .setDesc("插件默认凌晨 4 点才算新的一天(夜猫子睡前记的算前一晚); 每日笔记插件是零点。想和每日笔记一致就选 0。每日提醒的最晚时间也跟着变。")
+        .setDesc("插件默认凌晨 4 点才算新的一天(夜猫子睡前记的算前一晚); 每日笔记插件是零点。想和每日笔记一致就选 0。每日提醒的最晚时间也跟着变。这一项对所有账户生效。")
         .addDropdown((d) => d.addOptions(hourOpts).setValue(String(dshVal))
-          .onChange(async (v) => { st.dayStartHour = Number(v); setDayStartHour(st.dayStartHour); await plugin.persist(); this.display(); }));
+          .onChange(async (v) => { plugin.settings.dayStartHour = Number(v); setDayStartHour(plugin.settings.dayStartHour); await plugin.persist(); this.display(); }));
     }
 
     // ── 附件 ──────────────────────────────────────────────────────────────
@@ -6680,7 +6827,8 @@ class WechatDiarySettingTab extends PluginSettingTab {
         if (!v.ok) return { ok: false, text: v.error + " (没有保存)" };
         const base = folder === "/" ? "" : folder;
         const rel = v.value ? renderPath(v.value, todayD, moment) : "";
-        return { ok: true, text: "附件会存到: " + (plugin.writer._join(base, rel) || "库根目录") + "/" };
+        const w = this._writer();
+        return { ok: true, text: "附件会存到: " + (w._join(base, rel) || "库根目录") + "/" };
       });
       subSetting.addText((t) => t.setPlaceholder("YYYY/MM").setValue(subDraft)
         .onChange((v) => {
@@ -6705,25 +6853,25 @@ class WechatDiarySettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("提醒").setHeading();
     new Setting(containerEl)
       .setName("每日提醒")
-      .setDesc("到点时如果今天还什么都没记, 在微信上提醒你一次。只在这台电脑开着 Obsidian 时发得出; 连续 3 天没记就先不打扰, 等你回来再继续。")
-      .addToggle((t) => t.setValue(plugin.settings.reminderEnabled !== false)
-        .onChange(async (v) => { plugin.settings.reminderEnabled = v; await plugin.persist(); }));
+      .setDesc("到点时如果今天还什么都没记, 在微信上提醒你一次。只在这台电脑开着 Obsidian 时发得出; 连续 3 天没记就先不打扰, 等你回来再继续。每个账户各推各的。")
+      .addToggle((t) => t.setValue(st.reminderEnabled !== false)
+        .onChange(async (v) => { st.reminderEnabled = v; await plugin.persist(); }));
     new Setting(containerEl)
       .setName("提醒时间")
       .setDesc((() => {
-        const h = Number(plugin.settings.dayStartHour);
+        const h = Number(plugin.settings.dayStartHour);   // 逻辑日的边界是全局的(见「一天从几点开始」)
         const dsh = Number.isInteger(h) && h >= 0 && h <= 12 ? h : 4;
         if (dsh === 0) return "24 小时制, 如 21:30。一天从零点开始, 所以提醒最晚可设到 23:59";
         return "24 小时制, 如 21:30。凌晨 " + dsh + " 点前都算前一天, 所以提醒最晚可设到 " + String(dsh - 1).padStart(2, "0") + ":59";
       })())
       .addText((t) => {
-        let lastValid = plugin.settings.reminderTime || "21:30";
+        let lastValid = st.reminderTime || "21:30";
         t.setPlaceholder("21:30").setValue(lastValid)
           .onChange(async (v) => {
             const val = (v || "").trim();
             if (REMINDER_TIME_RE.test(val)) {
               lastValid = val;
-              plugin.settings.reminderTime = val;
+              st.reminderTime = val;
               await plugin.persist();
             } else if (/^\d{1,2}:\d{2}$/.test(val)) {
               // 形状完整但越界(25:00/21:75): 提示并回退, 不能静默落盘让提醒永久哑掉
@@ -6820,6 +6968,106 @@ function newAccount(id, label, diary) {
     profile: Object.assign({}, base.profile),
     session: Object.assign({}, base.session),
   };
+}
+
+// ── D18 第 5 步: 账户增删 + 两层同树校验(纯函数, bindtest 走 __internals)────────
+// 账户数软上限(docs/18 §7-5): 每个账户一条并发长轮询, 设置页也要看得下。
+const MAX_ACCOUNTS = 5;
+
+// 归一化账户日记根: 去首尾空白与 "/"。"/" 与 "" 都表示库根, 统一成 ""。
+// 只做这一层清洗(与 writer._root() 的 "/" → 库根一致), 不碰中间的空段 —— 那是格式校验的事。
+function normalizeAccountFolder(raw) {
+  let v = typeof raw === "string" ? raw.trim() : "";
+  v = v.replace(/^\/+/, "").replace(/\/+$/, "");
+  return v.trim();
+}
+
+// 一个账户"今天会写到哪个文件"。渲染不出来(格式非法/清洗后为空)返回 null:
+// 格式本身的问题交给路径格式控件的预览行报, 这里不重复报, 更不能让它把保存/启动弄崩。
+// 与 DiaryWriter.diaryPath() 同一条算法(根 + renderPath + ".md"), 只是不依赖 writer 实例。
+function accountDayPath(diary, opts) {
+  const d = diary || {};
+  const o = opts || {};
+  const rawFmt = (d.pathFormat === undefined || d.pathFormat === null || d.pathFormat === "") ? DEFAULT_SETTINGS.pathFormat : d.pathFormat;
+  const v = validatePathFormat(rawFmt, { requireDaily: true, momentLib: o.momentLib });
+  if (!v.ok) return null;
+  let rel = "";
+  try { rel = renderPath(v.value, o.today || logicalTodayStr(), o.momentLib); } catch (e) { return null; }
+  if (renderedPathError(rel)) return null;
+  const rawRoot = (d.diaryFolder === undefined || d.diaryFolder === null) ? DEFAULT_SETTINGS.diaryFolder : d.diaryFolder;
+  const root = normalizeAccountFolder(rawRoot);
+  return (root ? root + "/" : "") + rel + ".md";
+}
+
+// 两层同树校验(docs/18 §7-1, 已拍板"直接拦掉")。
+//   diary  = 待校验账户的 diary(候选值; 可以是还没落盘的草稿)
+//   others = 其它账户 [{ id, label, diary }]
+//   opts   = { momentLib, today }
+// 返回 { ok, error, conflictId }。error 一定点名是跟哪个账户撞的 —— 不然用户不知道该改哪一个。
+//
+// 为什么是两层: 只比 folder 不够 —— `日记` + `YYYY/YYYY-MM-DD` 与 `日记/2026` + `YYYY-MM-DD`
+// 的 folder 不同, 却都渲染成 `日记/2026/2026-09-10.md`, 两个号会往同一个文件里追加。
+function validateAccountTree(diary, others, opts) {
+  const d = diary || {};
+  const labelOf = (o) => (o && (o.label || o.id)) || "另一个账户";
+  const rawRoot = (d.diaryFolder === undefined || d.diaryFolder === null) ? DEFAULT_SETTINGS.diaryFolder : d.diaryFolder;
+  const myFolder = normalizeAccountFolder(rawRoot);
+  const list = Array.isArray(others) ? others : [];
+
+  // 第一层: 日记根归一化后唯一
+  for (const o of list) {
+    const od = (o && o.diary) || {};
+    const otherRaw = (od.diaryFolder === undefined || od.diaryFolder === null) ? DEFAULT_SETTINGS.diaryFolder : od.diaryFolder;
+    if (normalizeAccountFolder(otherRaw) === myFolder) {
+      return {
+        ok: false,
+        conflictId: (o && o.id) || "",
+        error: "日记文件夹和「" + labelOf(o) + "」是同一个(" + (myFolder || "库根目录") + "), 两个账户会写进同一棵树。请换一个文件夹。",
+      };
+    }
+  }
+
+  // 第二层: 各用各自 pathFormat 渲染"今天", 落到同一个文件也算撞
+  const myPath = accountDayPath(d, opts);
+  if (myPath) {
+    for (const o of list) {
+      const otherPath = accountDayPath((o && o.diary) || {}, opts);
+      if (otherPath && otherPath === myPath) {
+        return {
+          ok: false,
+          conflictId: (o && o.id) || "",
+          error: "今天的日记会和「" + labelOf(o) + "」写进同一个文件(" + myPath + "), 请改日记文件夹或路径格式。",
+        };
+      }
+    }
+  }
+  return { ok: true, error: null, conflictId: "" };
+}
+
+// 下一个未占用的账户 id(a1/a2/…): 删过账户再建不会把旧 id 回收给别的账户。
+function nextAccountId(accounts) {
+  const used = new Set((accounts || []).map((a) => a && a.id).filter(Boolean));
+  for (let i = 1; ; i++) { const id = "a" + i; if (!used.has(id)) return id; }
+}
+
+// 新账户的默认名「账户 N」: N 取新 id 的数字部分, 与用户看到的账户编号一致。
+function nextAccountLabel(accounts) {
+  return "账户 " + nextAccountId(accounts).slice(1);
+}
+
+// 新账户的默认日记根: 在**上一个账户的根**后面缀上自己的名字(「日记」+「账户 2」→「日记-账户2」),
+// 撞车就一直加后缀退让。继承而不是凭空造, 是为了让"加一个号"尽量少填东西(docs/18 §4)。
+function defaultAccountFolder(prevFolder, label, others) {
+  const base = normalizeAccountFolder(prevFolder);
+  const tag = String(label || "").replace(/\s+/g, "") || "账户";
+  const candidate = base ? base + "-" + tag : tag;
+  const taken = new Set((others || []).map((o) => normalizeAccountFolder(((o && o.diary) || {}).diaryFolder)));
+  if (!taken.has(normalizeAccountFolder(candidate))) return candidate;
+  for (let i = 2; i <= 99; i++) {
+    const c = candidate + "-" + i;
+    if (!taken.has(normalizeAccountFolder(c))) return c;
+  }
+  return candidate + "-" + Date.now();   // 理论上到不了; 真到了也不能返回一个撞车的名字
 }
 
 // 老的单账户 data → accounts[]。**纯函数**(不碰 secretStorage、不写盘), 便于表驱动测试。
@@ -6981,6 +7229,8 @@ class WechatDiaryPlugin extends Plugin {
     // D18 第 3 步: 每账户一套服务 + 一条管道。**必须在恢复分支之后、启动之前建好** ——
     // 下面所有判断与 onLayoutReady 启动都读 pipelines; 同时装上指向首个账户的兼容访问器。
     this._rebuildAccountServices();
+    // D18 第 5 步: 手改 data.json 弄出"两个账户同树"时警告一次(不拒绝启动、不改数据)
+    this._warnTreeConflicts();
 
     // 身份是从 secret 恢复来的 = data.json 没了 = 游标(buf)和去重表(recentSeqs)一起没了。
     // 此时服务端对空游标可能回吐一大段积压消息, 而去重表是空的 —— 照写就会把历史
@@ -7110,6 +7360,13 @@ class WechatDiaryPlugin extends Plugin {
     return (f && f.id) || FIRST_ACCOUNT_ID;
   }
 
+  // 设置页"当前账户"对象(docs/18 §2: activeAccount 只影响 UI, 不影响行为)。
+  // 一律经它取设置 —— plugin.settings 上的 17 个字段被 installSettingsShim 钉在账户 #1 上, 直接用它
+  // 编辑账户 #2 会改到账户 #1(这正是第 5 步要改的事)。
+  activeAccount() {
+    return this.accountById(this.activeAccountId()) || this.firstAccount();
+  }
+
   // D18 第 2 步: 每账户一套 writer/clipper/agent。**凡是把 this.data 整个换掉的地方都要重跑它** ——
   // unbind 会把 data 换成 DEFAULT_DATA(), 旧服务对象还指着旧账户(第 1 步已经在垫片上踩过一次同类坑)。
   // 第 3 步起它同时负责"对账"每账户一条管道: 保留还活着的账户的管道状态(加账户不能打断在跑的第一条),
@@ -7135,6 +7392,66 @@ class WechatDiaryPlugin extends Plugin {
   _defaultAccountId() {
     const f = this.firstAccount();
     return (f && f.id) || FIRST_ACCOUNT_ID;
+  }
+
+  // ── D18 第 5 步: 账户增删 ────────────────────────────────────────────────
+
+  // 造一个新账户并追加进 data.accounts(**不落盘、不建服务**), 返回它。
+  // diary 继承上一个账户 —— 加一个号不用从零配(路径格式/附件/提醒/剪藏全都跟着走);
+  // folder 换成不与任何人撞的默认名(docs/18 §4), ilink/profile/session 用空默认值等扫码绑定。
+  createAccount() {
+    const list = this.data.accounts || (this.data.accounts = []);
+    const id = nextAccountId(list);
+    const label = nextAccountLabel(list);
+    const prev = list.length ? list[list.length - 1] : null;
+    const inherited = (prev && prev.diary) ? Object.assign({}, prev.diary) : accountDiaryFromSettings(this.settings);
+    inherited.diaryFolder = defaultAccountFolder(inherited.diaryFolder, label, list);
+    const acct = newAccount(id, label, inherited);
+    list.push(acct);
+    return acct;
+  }
+
+  // 设置页「添加账户」: 软上限检查 → 建 → 落盘 → 重建服务(对账管道, 不打断在跑的那条) → 选中它。
+  async addAccount() {
+    if ((this.data.accounts || []).length >= MAX_ACCOUNTS) {
+      new Notice("最多 " + MAX_ACCOUNTS + " 个账户(每个账户一条并发长轮询)。要加新的, 先删掉一个吧。", 8000);
+      return null;
+    }
+    const acct = this.createAccount();
+    this.data.activeAccount = acct.id;
+    await this.persist();
+    this._rebuildAccountServices();
+    return acct;
+  }
+
+  // 删账户(docs/18 §5): 只删该账户的数据/密钥/管道, **绝不碰 vault 里已写的文件**
+  // (与"撤回只删引用、不删附件"同一条纪律)。
+  // 删掉最后一个时立刻补一个全新的空账户 —— 否则 accounts[0] 不存在, 垫片与凭据访问器都会指向空气;
+  // 那等价于"重置为未绑定", 提示里要跟用户说清。
+  async deleteAccount(id) {
+    const aid = id || this.activeAccountId();
+    const list = this.data.accounts || [];
+    const idx = list.findIndex((a) => a && a.id === aid);
+    if (idx < 0) return;
+    const acct = list[idx];
+    this.stopPipeline(aid);              // 只停这一条: 删 A 不该打断 B
+    this.setBotToken("", aid);           // 清该账户的密钥(账户 #1 连旧的无后缀 key 一起清)
+    this.setBindIdentity("", "", "", aid);
+    if (this._declinedClaimSets) delete this._declinedClaimSets[aid];
+    if (this._statusById) delete this._statusById[aid];
+    // 记下 diary: 删最后一个时要拿它给新账户兜底(与旧 unbind 保留 settings 同款 ——
+    // "重置为未绑定"不该把用户配好的文件夹/格式/提醒一起清掉)。必须在 splice 之前读,
+    // 否则 settings 上的反向垫片会跟着 accounts[0] 一起悬空, 读到一片 undefined。
+    const keptDiary = (acct.diary && typeof acct.diary === "object") ? Object.assign({}, acct.diary) : accountDiaryFromSettings(this.settings);
+    list.splice(idx, 1);
+    if (!list.length) this.data.accounts = [newAccount(FIRST_ACCOUNT_ID, "账户 1", keptDiary)];
+    // 选中"邻居"(原位置那个; 删的是最后一个就退一个), 用户不会忽然失去上下文
+    const rest = this.data.accounts;
+    const next = rest[Math.min(idx, rest.length - 1)];
+    this.data.activeAccount = (next && next.id) || FIRST_ACCOUNT_ID;
+    await this.persist();
+    this._rebuildAccountServices();      // 对账: 删掉它的 pipelines, 保留其它在跑的
+    this._setStatus(this.bindState(this.data.activeAccount) === "none" ? "未绑定" : "已连接", this.data.activeAccount);
   }
 
   // 取(必要时新建)某账户的管道状态。惰性新建是为了让"先有账户、后有管道"的顺序都能工作。
@@ -7357,6 +7674,29 @@ class WechatDiaryPlugin extends Plugin {
     this._setStatus("未绑定");
   }
 
+  // D18 第 5 步: 单个账户解绑(设置页每行的「解除绑定 / 清除残留凭据」)。
+  // 与 plugin.unbind() 不同 —— 那个是把整个 data 换成 DEFAULT_DATA()("回到全新安装", 所有账户一起没);
+  // 这个只动选中的那一个账户, 其余账户照跑(旧页面只有一个账户, 两个入口等价)。
+  // **保留 label 与 diary**: 解绑不该让用户的文件夹/路径格式/提醒配置跟着消失(与 unbind 保留 settings 同款)。
+  async unbindAccount(id, keepToken) {
+    const aid = id || this.activeAccountId();
+    const acct = this.accountById(aid);
+    if (!acct) return;
+    const token = keepToken ? this.getBotToken(aid) : "";
+    this.stopPipeline(aid);
+    this.setBotToken("", aid);
+    this.setBindIdentity("", "", "", aid);
+    // 保留 diary/label, 重置 ilink/profile/session(用户的习惯状态跟着账户走, 解绑等于换人)
+    const fresh = newAccount(aid, acct.label || "账户", acct.diary || {});
+    this.data.accounts[this.data.accounts.indexOf(acct)] = fresh;
+    if (token) this.setBotToken(token, aid);   // keepToken: 回到"待认领", 管道继续跑, 等人发消息
+    if (this._declinedClaimSets) delete this._declinedClaimSets[aid];
+    await this.persist();
+    this._rebuildAccountServices();
+    if (token) { this.startPipeline(aid); return; }
+    this._setStatus("未绑定", aid);
+  }
+
   // ── 消息管道 ──
 
   // D18 第 3 步: 每账户一条。id 不传 = 首个账户(旧调用点与单账户行为不变)。
@@ -7511,6 +7851,23 @@ class WechatDiaryPlugin extends Plugin {
     const acct = this.accountById(id || this._defaultAccountId());
     const v = acct && acct.diary ? acct.diary[key] : undefined;
     return v === undefined ? this.settings[key] : v;
+  }
+
+  // 加载时兜底(docs/18 §7-1): data.json 被手改出"两个账户同树"时给一条 Notice 说清是哪两个,
+  // 但**绝不拒绝启动、也绝不改用户数据** —— 手改过什么是用户的自由, 改哪一边由他决定。
+  // 只与"在它之前的账户"比, 一对撞车只报一次; 账户数上限 5, 这点比较可以忽略不计。
+  _warnTreeConflicts() {
+    const list = this.data.accounts || [];
+    if (list.length < 2) return;
+    const brief = (a) => ({ id: a.id, label: a.label, diary: { diaryFolder: this._st("diaryFolder", a.id), pathFormat: this._st("pathFormat", a.id) } });
+    for (let i = 1; i < list.length; i++) {
+      const mine = brief(list[i]);
+      const r = validateAccountTree(mine.diary, list.slice(0, i).map(brief), { momentLib: moment, today: logicalTodayStr() });
+      if (r.ok) continue;
+      const other = this.accountById(r.conflictId);
+      new Notice("⚠️ 微信日记: 账户「" + (list[i].label || list[i].id) + "」和「" + ((other && other.label) || r.conflictId) + "」的日记会写到一起 —— " +
+        r.error + "\n(数据没有被改动。打开插件设置页, 给其中一个换个日记文件夹或路径格式即可。)", 15000);
+    }
   }
 
   async _reminderTickOne(id) {
@@ -7824,6 +8181,9 @@ WechatDiaryPlugin.__internals = {
   // D18 账户层(第 1 步)
   migrateAccounts, accountDiaryFromSettings, newAccount, installAccountShim, installSettingsShim,
   ACCOUNT_DIARY_FIELDS, FIRST_ACCOUNT_ID, ACCOUNT_TOKEN_KEY, ACCOUNT_IDENTITY_KEY,
+  // D18 第 5 步: 两层同树校验 + 账户增删的纯逻辑
+  validateAccountTree, normalizeAccountFolder, accountDayPath,
+  nextAccountId, nextAccountLabel, defaultAccountFolder, MAX_ACCOUNTS,
   DEFAULT_DATA,
 };
 

@@ -129,6 +129,32 @@ Object.defineProperty(this.data, "session", { get: () => this.data.accounts[0].s
    只有 token 会从密钥回填——症状是"看起来还能用，但设置和状态被悄悄重置"。
    用例【D18】的"二次启动幂等"就是盯这个的。
 
+### 3.3 落地第 5 步抓到的坑（设置页与账户层咬合处）
+
+1. **`deleteAccount` 删最后一个账户时，兜底的 diary 必须在 `splice` 之前读**。
+   `installSettingsShim` 把那 17 个键定义成指向 `data.accounts[0].diary` 的访问器；一旦把唯一的账户
+   从数组里摘掉，`this.settings.diaryFolder` 立刻变 `undefined`。于是
+   `accountDiaryFromSettings(this.settings)` 写在 `splice` 之后，会把用户配好的文件夹/格式/提醒
+   全丢成默认值——症状是"只是删了个账户，设置也跟着回出厂"。修法：`splice` 之前
+   `Object.assign({}, acct.diary)` 兜住（正文 §8 的 `keptDiary`）。证据：把它挪回 `splice` 之后跑
+   bindtest，`【D18-5】`「用户配好的文件夹没有因这次重置而丢」挂，738/739。
+2. **把 `const st = plugin.settings` 换成账户 diary 时，全局字段会被顺手带走**。
+   `dayStartHour` 原来是从 `st`（= `plugin.settings`）读写的，现在 `st` 是账户 diary——继续读会读到
+   `undefined`（下拉显示回 4 点），继续写会把 `dayStartHour` 塞进账户 diary 且
+   `setDayStartHour(undefined)` 变成 NaN，**「一天从几点开始」从此静默失效**。`saveVoiceAudio` /
+   `timezone` / AI 三项同理（它们都不在 `ACCOUNT_DIARY_FIELDS` 里）。这一类**没有自动用例兜底**
+   （设置页 DOM 不渲染），只能逐个拿 `ACCOUNT_DIARY_FIELDS` 名单核对。
+3. **`_fmtCustom` 是 UI 状态，不能搭车进账户 diary**：`st._fmtCustom` 原本就是
+   `plugin.settings._fmtCustom`；`st` 换成账户 diary 后若不动它，这个键会落进 `accounts[0].diary`，
+   既改落盘形状，又让"自定义路径格式"这一档变成每账户一份。留在 `plugin.settings`。
+4. **`_pathSuggest` 需要"拒绝"这条路**：它的 `onPick` 原来只被当"已经选定"。同树校验要"不落盘 +
+   输入框回退"，所以改成 `onPick` 返回 `false` 时 `t.setValue(prev)` 且不更新 `saved`。不改的话页面
+   显示的是被拒绝的值、`data.json` 里却是旧值——比直接报错更难查。
+5. **第二层比的是"根 + 渲染出的相对路径"，而根是字面文件夹名**。最初以为
+   `folder="日记/[x]"` 会和 `pathFormat="[x]/YYYY-MM-DD"` 撞——其实 folder 不做 moment 解析，
+   前者是名字真的叫 `[x]` 的文件夹。实测用例「方括号字面量 folder 也能撞上」当场挂，才把期望改成
+   "**渲染出的** `[x]`"对"**根文件夹真的叫** `x`"（`日记` + `[x]/YYYY-MM-DD` vs `日记/x` + `YYYY-MM-DD`）。
+
 
 
 ## 4. 运行时结构
@@ -202,15 +228,25 @@ plugin
      `renderPath(pathFormat, 今天, moment)` 渲染当天路径比一次，撞了也拒。这一层直接复用既有的
      `validatePathFormat` / `renderedPathError`，不新写渲染逻辑。
    - 报错要说清**跟哪个账户撞的**（"与「工作号」的日记会写进同一个文件"），否则用户不知道改哪个。
+   - ⚠️ **落地修正（第 5 步，2026-09-13）**：这里的举例写错了——`pathFormat=YYYY` 渲染成 `2026`，
+     A 落 `日记/2026.md`、B 落 `日记/2026/2026-09-10.md`，两者**不撞**；而且 `YYYY` 本身过不了
+     `validatePathFormat(requireDaily)`（两天会渲染成同一个文件）。真正撞的是 `folder=日记` +
+     `pathFormat=YYYY/YYYY-MM-DD`（就是默认格式）对 `folder=日记/2026` + `pathFormat=YYYY-MM-DD`，
+     两边都是 `日记/2026/2026-09-10.md`。实现与用例按这个来；没有加"folder 嵌套即冲突"的第三层
+     （那会误伤 `生活号` 放 `日记/2026` 下这种其实不撞的配置）。
 2. ✅ **`reminderEnabled` / `reminderTime` 下放**（2026-09-10 拍板）。`_reminderTick` 按账户遍历、
    各读各自的时间与开关——"工作号 18:00、生活号 22:00"由此成立。
 3. ✅ **`webClip*` 开关与剪藏目录下放**（同日拍板）。代价是 `WebClipper` 要按账户实例化
    （与 writer 同一批改），剪藏目录默认也跟着该账户的日记根走。
 4. ✅ **时区 / 一天从几点开始 / 夜间提示起点：保持全局**（§2 表里已写明它们卡在模块级状态上）。
    确实要每账户不同的话，那是单独一轮"把时间底座改成可传参"的改动，不混在这次重构里。
-5. **账户数上限**：建议软上限 5 个（每条是一份并发长轮询，且设置页要能看）。
-6. **跨账户的"今天记了几段"**：`在吗` 只报自己账户的（③的必然结果），确认即可。
-7. 设置页账户列表是否显示每个账户的"最近一次收到消息时间"（诊断用，0.4.0 已有 `lastAliveTs`）。
+5. ✅ **账户数上限：软上限 5 个**（2026-09-13 第 5 步落地，`MAX_ACCOUNTS = 5`；到顶时 `Notice`
+   说明原因，不静默失败）。每条是一份并发长轮询，且设置页要能看。
+6. ✅ **跨账户的"今天记了几段"：只报自己账户的**（确认无误：第 3 步起 writer 与提醒都按账户走，
+   「在吗」/`countDay` 各数各自的树；`【D18-3】` 的正反两条用例钉着）。
+7. ⏸ 设置页账户列表是否显示每个账户的"最近一次收到消息时间"（诊断用，0.4.0 已有 `lastAliveTs`）
+   —— 第 5 步拍板**本轮不显示**：账户列表先只显示绑定状态（已绑定 / 待认领 / 未绑定），
+   `lastAliveTs` 诊断等真有人需要时再加（它还在每个账户的 `ilink` 里，加它不需要动数据模型）。
 
 ## 8. 实现顺序（建议）
 
@@ -312,6 +348,69 @@ plugin
 
 5. **设置页重构**：账户列表 + 选中账户编辑它那一套 + 添加/删除/重绑 + 两层同树校验
    → 用例 4/12 + 手测扫码。
+
+   **落地记录（2026-09-13，已实现）**：
+
+   - **设置页结构**：顶部「微信账户」区，一行一个账户——可改的 `label` 输入框、绑定状态文案
+     （已绑定显示 `userId` 前 18 位 / 待认领 / 未绑定）、「扫码绑定 / 重新扫码」「解除绑定 /
+     清除残留凭据」「删除」三个按钮；紧接着一行是该账户**自己的**「日记文件夹」（复用既有
+     `_pathSuggest` 文件夹选择器）。点行标题（避开控件区域）把该账户设成 `data.activeAccount`
+     并 `this.display()`。底部「添加账户」（软上限 5，到顶 `Notice` 说明原因，建成后立刻开该账户的
+     `QrLoginModal`）。下面「日记」「附件」「写进已有的每日笔记」「提醒」「剪藏」几组外观不变，
+     读写目标换成 `plugin.activeAccount().diary`。
+   - **"编辑当前账户"的落点**：设置页新增 `_aid()/_acct()/_writer()/_d()/_view()` 五个帮手，
+     `const st = this._d()` 取代原先的 `plugin.settings`；凡读 `plugin.writer` 的帮手
+     （`_foreignCheck` / `_headingCollisionCheck` / 路径格式预览行 / 附件预览行 / `_suggestImportOnEnable` /
+     `_importDailyNotes`）改走 `_writer()`；吃 "settings 形状" 的纯函数（`defaultWebClipFolder` /
+     `webClipMaxImages` / `webClipMaxTotalImageBytes`）喂 `_view()`。全局字段（`timezone` /
+     `dayStartHour` / `saveVoiceAudio` / AI 三项 / `_fmtCustom`）仍读 `plugin.settings`。
+   - **两层同树校验**：新增纯函数 `validateAccountTree(diary, others, { momentLib, today })`
+     → `{ ok, error, conflictId }`。第一层 folder 归一化（去首尾空白与 `/`；`"/"` 与 `""` 都算库根）
+     后唯一；第二层各用各的 `pathFormat`，经**既有** `validatePathFormat` + `renderPath` 渲染
+     "今天"、拼成 `根/渲染路径.md` 再比一次，撞了也拒；两层报错都点名对方 `label`。
+     接在五处：①行内账户 folder 选择器 ②「日记文件夹」③路径格式预览行 ④路径格式预设下拉
+     ⑤「从每日笔记设置导入」。做法是"不合法就不落盘"：folder 选择器 `onPick` 返回 `false` →
+     `_pathSuggest` 回退输入框且不更新 `saved`；路径格式预览行变红写"(没有保存)"；
+     离散动作（下拉/导入）弹 `Notice`。
+   - **加载兜底**：`_warnTreeConflicts()` 在 `onload` 里逐对比较，撞了就一条 `Notice` 点名两个账户，
+     **不拒绝启动、不改用户数据**。
+   - **增删**：`createAccount()`（纯内存：`nextAccountId` / `nextAccountLabel` /
+     `defaultAccountFolder`；diary 继承上一个账户、folder 在上一账户根后面缀 label 并逐个让开）/
+     `addAccount()`（上限检查 + 落盘 + `_rebuildAccountServices()` 对账，不打断在跑的管道）/
+     `deleteAccount(id)`（停该账户管道、清 `:id` 密钥与身份副本、摘数组、重建服务、落盘；
+     **不碰 vault 里已写的文件**；删最后一个时立刻补一个空账户并保留用户的 diary）/
+     `unbindAccount(id, keepToken)`（单账户解绑，保留 diary/label）。
+
+   **与规格的偏差**：
+
+   - **规格没写"解除绑定"按钮去哪**。旧页面的「解除绑定 / 清除残留凭据」是 v0.2.1 的关键修复
+     （半绑定必须清得掉），不能消失；但 `plugin.unbind()` 会把整个 `data` 换成 `DEFAULT_DATA()`
+     （所有账户一起没），两个账户时是陷阱。于是新增 `unbindAccount(id, keepToken)` 并把它下放到
+     每个账户行：只动选中账户、保留 diary；单账户下与旧 `unbind` 等价（旧 `unbind` 保留 settings，
+     这里保留 diary，重置的都是 `ilink`/`profile`/`session`）。
+   - **旧顶部「微信」标题 + 独立「绑定状态」块被「微信账户」列表取代**，不再是两个地方都能扫码。
+   - **§7-1 的举例写错了**（详见 §7-1 的落地修正）：真正撞的是 `日记` + `YYYY/YYYY-MM-DD`
+     对 `日记/2026` + `YYYY-MM-DD`。第二层按"当天整条文件路径相等"实现，**没有**加"folder 嵌套
+     即冲突"的第三层。
+   - **每个账户占两行 Setting**（规格说"每行显示"，但一行里塞 2 个输入框 + 3 个按钮在 Obsidian 的
+     `setting-item-control` 里会挤成一团）：第一行身份 + 状态 + 三个按钮，第二行该账户的日记文件夹。
+   - **`_fmtCustom` 留在 `plugin.settings`**：它是 UI 状态不是日记设置，放进账户 diary 会改落盘形状，
+     还会让"自定义档位"变成每账户一份。
+   - 文件夹是**字面量**、`pathFormat` 才是 moment 格式：`[x]` 出现在 folder 里不做日期解析
+     （详见 §3.3-5）。
+
+   **落地第 5 步抓到的坑**：见 §3.3（删最后一个账户的兜底次序、全局字段被 `st` 带走、
+   `_fmtCustom`、`_pathSuggest` 的拒绝路径、第二层的"根是字面量"）。
+
+   **用例**：新增 `【D18-5】`（bindtest，69 条断言）：`validateAccountTree` 第一层
+   （`/日记` / `日记/` / ` 日记 ` 归一化等价、库根、`[x]`、空参数不炸）与第二层（真撞的 pair、
+   报错带文件路径、对方/自己格式非法都不炸、第一层优先）；默认 folder 让开（撞了加 `-2`、
+   库根继承用 label、斜杠空白先归一化、`nextAccountId`/`nextAccountLabel`）；`addAccount`
+   （id/label/diary 继承/空状态/落盘/服务重建/不打断在跑管道/上限 5 与提示）；`deleteAccount`
+   （只删 a2、密钥清空、a1 一字节不动、选中邻居、删最后一个补空账户且保住 folder）；
+   `unbindAccount`（只动一个、keepToken 回 half）；设置页帮手（`_d()` 是当前账户、改 a2 不碰 a1、
+   `plugin.settings` 仍钉在账户 #1、`_writer()`/`_view()` 跟着账户）；加载兜底警告。
+   实测 `npm run verify`：bindtest **739**（670 + 69），webcliptest **92**，既有断言零删改。
 
 每步一个提交，**第 1 步合进去不改变任何行为**，2 之后随时可停（第 2 步做完就已经"两个账户各写各的树"，
 只是还不能同时在线）。

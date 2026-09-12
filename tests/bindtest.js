@@ -1887,6 +1887,209 @@ async function newPlugin(secrets, storedData) {
     p8.stopPipeline();
   }
 
+  console.log("\n【D18-5】设置页重构: 账户增删/重绑 + 两层同树校验(多账户第 5 步)");
+  {
+    // 设置页本身有 DOM, 既有用例不渲染它 —— 所以本组测的是它背后的纯函数与插件方法
+    // (validateAccountTree / addAccount / deleteAccount / unbindAccount / activeAccount + 设置页帮手)。
+    const today = "2026-09-10";
+    const V = (cand, others) => I.validateAccountTree(cand, others, { momentLib: momentStub, today });
+    const mkTwo = async (diaryA, diaryB, secretsIn) => {
+      const secrets = secretsIn || {
+        [SECRET_TOKEN]: "TOK-A",
+        [SECRET_TOKEN + ":a2"]: "TOK-B",
+        [SECRET_ID]: JSON.stringify({ userId: "U1", botId: "B1", baseUrl: "https://a.example" }),
+        [SECRET_ID + ":a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "https://b.example" }),
+      };
+      const p = await newPlugin(secrets, BOUND_DATA());
+      p.data.accounts[0].ilink.userId = "U1";
+      p.data.accounts[0].ilink.baseUrl = "https://a.example";
+      Object.assign(p.data.accounts[0].diary, diaryA || {});
+      const a2 = I.newAccount("a2", "账户 2", Object.assign({ diaryFolder: "乙" }, diaryB || {}));
+      a2.ilink.userId = "U2"; a2.ilink.botId = "B2"; a2.ilink.baseUrl = "https://b.example";
+      p.data.accounts.push(a2);
+      p._rebuildAccountServices();
+      return p;
+    };
+
+    console.log("  — D18-5.1 第一层: folder 归一化后唯一");
+    const work = { id: "a1", label: "工作号", diary: { diaryFolder: "日记", pathFormat: "YYYY/YYYY-MM-DD" } };
+    const r1 = V({ diaryFolder: "日记", pathFormat: "YYYY/YYYY-MM-DD" }, [work]);
+    check("D18-5 同一个 folder → 拒", r1.ok === false, JSON.stringify(r1));
+    check("D18-5 报错点名对方(label)", String(r1.error).includes("工作号"), r1.error);
+    check("D18-5 conflictId 指向对方账户", r1.conflictId === "a1", r1.conflictId);
+    check("D18-5 /日记 归一化后与 日记 等价 → 拒", V({ diaryFolder: "/日记" }, [work]).ok === false);
+    check("D18-5 日记/ 归一化后等价 → 拒", V({ diaryFolder: "日记/" }, [work]).ok === false);
+    check("D18-5 「 日记 」去空白后等价 → 拒", V({ diaryFolder: " 日记 " }, [work]).ok === false);
+    check("D18-5 不同的 folder → 放行", V({ diaryFolder: "生活", pathFormat: "YYYY-MM-DD" }, [work]).ok === true,
+      JSON.stringify(V({ diaryFolder: "生活", pathFormat: "YYYY-MM-DD" }, [work])));
+    check("D18-5 没有别的账户 → 放行", V({ diaryFolder: "日记" }, []).ok === true);
+    check("D18-5 库根 vs 库根 → 拒(都归一化成空)", V({ diaryFolder: "/" }, [{ id: "a2", label: "生活号", diary: { diaryFolder: "/" } }]).ok === false);
+    check("D18-5 库根单独用 → 放行(边界不炸)", V({ diaryFolder: "/" }, []).ok === true && V({ diaryFolder: "" }, []).ok === true);
+    check("D18-5 [x] 这类字面量 folder 不炸", V({ diaryFolder: "[x]" }, [work]).ok === true);
+    check("D18-5 空/缺 diary 参数不炸", V(undefined, undefined).ok === true && V({}, []).ok === true);
+
+    console.log("  — D18-5.2 第二层: folder 不同, 但当天会落到同一个文件");
+    const lifeYear = { id: "a2", label: "生活号", diary: { diaryFolder: "日记/2026", pathFormat: "YYYY-MM-DD" } };
+    const r2 = V({ diaryFolder: "日记", pathFormat: "YYYY/YYYY-MM-DD" }, [lifeYear]);
+    check("D18-5 日记+YYYY/YYYY-MM-DD vs 日记/2026+YYYY-MM-DD → 拒(同一个文件)", r2.ok === false, JSON.stringify(r2));
+    check("D18-5 第二层的报错也点名对方", String(r2.error).includes("生活号"), r2.error);
+    check("D18-5 报错里带上会撞的那个文件路径", String(r2.error).includes("日记/2026/2026-09-10.md"), r2.error);
+    check("D18-5 设计稿举例的 pathFormat=YYYY 本身就不是合法日记格式(两天会写进同一文件)",
+      I.validatePathFormat("YYYY", { requireDaily: true, momentLib: momentStub }).ok === false,
+      JSON.stringify(I.validatePathFormat("YYYY", { requireDaily: true, momentLib: momentStub })));
+    check("D18-5 渲染里的 [x] 字面量也能撞上真实文件夹 日记/x", V({ diaryFolder: "日记", pathFormat: "[x]/YYYY-MM-DD" },
+      [{ id: "a2", label: "生活号", diary: { diaryFolder: "日记/x", pathFormat: "YYYY-MM-DD" } }]).ok === false);
+    check("D18-5 对方格式非法 → 第二层跳过(不炸)且放行", V({ diaryFolder: "甲", pathFormat: "YYYY-MM-DD" },
+      [{ id: "a2", label: "坏格式", diary: { diaryFolder: "乙", pathFormat: "Assets/YYYY" } }]).ok === true);
+    check("D18-5 自己格式非法也不炸(交给路径格式预览行去报)", V({ diaryFolder: "甲", pathFormat: "Assets/YYYY" }, [lifeYear]).ok === true);
+    check("D18-5 归一化后同一个文件夹优先级高于渲染(报第一层的错)", (() => {
+      const r = V({ diaryFolder: " 日记/ ", pathFormat: "YYYY" }, [work]);
+      return r.ok === false && String(r.error).includes("同一个") && !String(r.error).includes("同一个文件");
+    })());
+
+    console.log("  — D18-5.3 新账户默认 folder 自动让开");
+    const taken = [
+      { id: "a1", label: "账户 1", diary: { diaryFolder: "日记" } },
+      { id: "a2", label: "账户 2", diary: { diaryFolder: "日记-账户2" } },
+    ];
+    const f3 = I.defaultAccountFolder("日记", "账户 3", taken);
+    check("D18-5 上一个账户是 日记 → 默认 日记-账户3", f3 === "日记-账户3", f3);
+    const f2 = I.defaultAccountFolder("日记", "账户 2", taken);
+    check("D18-5 默认名撞了就再退让(日记-账户2 → 日记-账户2-2)", f2 === "日记-账户2-2", f2);
+    check("D18-5 让开后的默认名确实不与任何人撞(含第二层)", V({ diaryFolder: f2, pathFormat: "YYYY/YYYY-MM-DD" }, taken).ok === true, f2);
+    check("D18-5 库根继承时用 label 当根名", I.defaultAccountFolder("/", "账户 2", []) === "账户2", String(I.defaultAccountFolder("/", "账户 2", [])));
+    check("D18-5 上一个 folder 的斜杠/空白先归一化", I.defaultAccountFolder("日记/", "账户 2", [{ id: "a1", diary: { diaryFolder: " 日记 " } }]) === "日记-账户2");
+    check("D18-5 nextAccountId 跳过已占用的", I.nextAccountId([{ id: "a1" }, { id: "a3" }]) === "a2", I.nextAccountId([{ id: "a1" }, { id: "a3" }]));
+    check("D18-5 nextAccountLabel 跟着新 id 走", I.nextAccountLabel([{ id: "a1" }, { id: "a3" }]) === "账户 2", I.nextAccountLabel([{ id: "a1" }, { id: "a3" }]));
+
+    console.log("  — D18-5.4 添加账户: id / label / 继承 / 软上限 5");
+    const pAdd = await newPlugin({ [SECRET_TOKEN]: "TOK-A" }, BOUND_DATA());
+    pAdd.data.accounts[0].diary.pathFormat = "YYYY-MM-DD";
+    pAdd.data.accounts[0].diary.webClipMaxImages = 7;
+    pAdd.data.accounts[0].diary.reminderTime = "18:00";
+    const a2 = await pAdd.addAccount();
+    check("D18-5 新账户 id 取未占用的 a2", !!a2 && a2.id === "a2", JSON.stringify(a2 && a2.id));
+    check("D18-5 新账户 label 默认「账户 2」", !!a2 && a2.label === "账户 2", a2 && a2.label);
+    check("D18-5 新账户 diary 继承上一个账户(格式/剪藏/提醒都跟着走)",
+      a2.diary.pathFormat === "YYYY-MM-DD" && a2.diary.webClipMaxImages === 7 && a2.diary.reminderTime === "18:00", JSON.stringify(a2.diary));
+    check("D18-5 新账户 folder 让开(两层都不撞)", V(a2.diary, [{ id: "a1", label: "账户 1", diary: pAdd.data.accounts[0].diary }]).ok === true, a2.diary.diaryFolder);
+    check("D18-5 新账户是空的(等扫码)", !a2.ilink.userId && !a2.ilink.botId && a2.profile.state === "unknown", JSON.stringify(a2.ilink));
+    check("D18-5 已落盘 + 服务重建 + 选中新账户", pAdd._stored.accounts.length === 2 && !!pAdd.writers.a2 && pAdd.data.activeAccount === "a2",
+      JSON.stringify([pAdd._stored.accounts.length, !!pAdd.writers.a2, pAdd.data.activeAccount]));
+    const a3 = await pAdd.addAccount();
+    check("D18-5 再加一个: id/label 继续递增", a3.id === "a3" && a3.label === "账户 3", JSON.stringify([a3.id, a3.label]));
+    check("D18-5 继承上一个账户的 folder 但改了名(只有 folder 让开)",
+      a3.diary.diaryFolder !== a2.diary.diaryFolder && a3.diary.pathFormat === "YYYY-MM-DD", a3.diary.diaryFolder);
+    const cKeep = { destroyAll() {}, notify() {} };
+    pAdd.pipelines.a1.client = cKeep; pAdd.pipelines.a1.running = true;
+    const a4 = await pAdd.addAccount();
+    check("D18-5 添加账户不打断在跑的账户 #1 管道(对账保留)",
+      pAdd.pipelines.a1.running === true && pAdd.pipelines.a1.client === cKeep && !!pAdd.pipelines[a4.id],
+      JSON.stringify([pAdd.pipelines.a1.running, pAdd.pipelines.a1.client === cKeep]));
+    await pAdd.addAccount();   // 第 5 个
+    check("D18-5 到软上限 5 个", pAdd.data.accounts.length === 5, String(pAdd.data.accounts.length));
+    const noticesBefore = notices.length;
+    const over = await pAdd.addAccount();
+    check("D18-5 第 6 个被拒, 账户数不动", over === null && pAdd.data.accounts.length === 5, JSON.stringify(over));
+    check("D18-5 上限提示写明了原因与上限", notices.length > noticesBefore && notices[notices.length - 1].includes("最多 5 个"), notices[notices.length - 1]);
+
+    console.log("  — D18-5.5 删除账户: 摘数据/密钥/管道, 绝不碰 vault 文件与其它账户");
+    const sDel = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + ":a2"]: "TOK-B", [SECRET_ID + ":a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "" }) };
+    const pDel = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" }, sDel);
+    const cDel = { destroyed: false, destroyAll() { this.destroyed = true; }, notify() {} };
+    pDel.pipelines.a2.client = cDel; pDel.pipelines.a2.running = true;
+    const a1DiaryBefore = JSON.stringify(pDel.data.accounts[0].diary);
+    await pDel.deleteAccount("a2");
+    check("D18-5 删 a2 后只剩 a1", pDel.data.accounts.length === 1 && pDel.data.accounts[0].id === "a1", JSON.stringify(pDel.data.accounts.map((x) => x.id)));
+    check("D18-5 writers.a2 消失、a1 还在", pDel.writers.a2 === undefined && !!pDel.writers.a1);
+    check("D18-5 a2 的管道对象也清掉了", pDel.pipelines.a2 === undefined && pDel.pipelines.a1 !== undefined, JSON.stringify(Object.keys(pDel.pipelines)));
+    check("D18-5 a2 的密钥被清(token 与身份都空)", sDel[SECRET_TOKEN + ":a2"] === "" && sDel[SECRET_ID + ":a2"] === "", JSON.stringify(sDel));
+    check("D18-5 a1 的数据一个字节没动", JSON.stringify(pDel.data.accounts[0].diary) === a1DiaryBefore, JSON.stringify(pDel.data.accounts[0].diary));
+    check("D18-5 a1 的 token/绑定不受影响", pDel.getBotToken("a1") === "TOK-A" && pDel.bindState("a1") === "bound", JSON.stringify([pDel.getBotToken("a1"), pDel.bindState("a1")]));
+    check("D18-5 删除后选中的是邻居(不悬空)", pDel.data.activeAccount === "a1", pDel.data.activeAccount);
+    check("D18-5 落盘里 a2 也没了", pDel._stored.accounts.length === 1, JSON.stringify(pDel._stored.accounts));
+
+    console.log("  — D18-5.6 删最后一个账户: 立刻补一个全新的空账户(= 重置为未绑定)");
+    const pLast = await newPlugin({ [SECRET_TOKEN + ":a1"]: "TOK-ONLY" }, BOUND_DATA());
+    pLast.data.accounts[0].diary.diaryFolder = "只有这个";
+    await pLast.deleteAccount("a1");
+    check("D18-5 删完仍有一个账户(垫片/凭据访问器不指向空气)",
+      pLast.data.accounts.length === 1 && pLast.data.accounts[0].id === "a1" && !!pLast.writers.a1, JSON.stringify(pLast.data.accounts));
+    check("D18-5 新账户是空的: bindState 回到 none/half", ["none", "half"].includes(pLast.bindState()), pLast.bindState());
+    check("D18-5 凭据清干净(带后缀的与身份副本都空)", pLast.getBotToken("a1") === "" && !pLast.data.accounts[0].ilink.userId, JSON.stringify([pLast.getBotToken("a1"), pLast.data.accounts[0].ilink.userId]));
+    check("D18-5 垫片还活着(写 session 不崩)", (() => {
+      try { pLast.data.session.reminded_date = "2026-09-10"; return pLast.data.accounts[0].session.reminded_date === "2026-09-10"; }
+      catch (e) { return false; }
+    })());
+    check("D18-5 用户配好的文件夹没有因这次重置而丢", pLast.data.accounts[0].diary.diaryFolder === "只有这个", pLast.data.accounts[0].diary.diaryFolder);
+
+    console.log("  — D18-5.7 选中编辑: 读写的必须是「当前账户」的 diary");
+    const pSel = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" });
+    const tab = pSel.settingTab;
+    check("D18-5 默认编辑账户 #1", tab._aid() === "a1" && tab._d() === pSel.data.accounts[0].diary && tab._writer() === pSel.writers.a1,
+      JSON.stringify([tab._aid(), tab._writer() === pSel.writers.a1]));
+    pSel.data.activeAccount = "a2";
+    check("D18-5 切到 a2 后编辑目标是 a2 的 diary", tab._aid() === "a2" && tab._d() === pSel.data.accounts[1].diary);
+    check("D18-5 帮手拿的是 a2 自己的 writer 与设置视图",
+      tab._writer() === pSel.writers.a2 && tab._view().diaryFolder === "乙" && pSel.settings.diaryFolder === "甲",
+      JSON.stringify([tab._writer() === pSel.writers.a2, tab._view().diaryFolder, pSel.settings.diaryFolder]));
+    const a1DiaryBefore2 = JSON.stringify(pSel.data.accounts[0].diary);
+    tab._d().diaryFolder = "乙改";
+    tab._d().reminderTime = "22:00";
+    tab._d().webClipEnabled = true;
+    await pSel.persist();
+    check("D18-5 改 a2 的设置不碰 a1 的 diary", JSON.stringify(pSel.data.accounts[0].diary) === a1DiaryBefore2, JSON.stringify(pSel.data.accounts[0].diary));
+    check("D18-5 改动落在 a2 且已落盘",
+      pSel.data.accounts[1].diary.diaryFolder === "乙改" && pSel._stored.accounts[1].diary.diaryFolder === "乙改" && pSel._stored.accounts[0].diary.diaryFolder === "甲",
+      JSON.stringify([pSel._stored.accounts[1].diary.diaryFolder, pSel._stored.accounts[0].diary.diaryFolder]));
+    check("D18-5 plugin.settings 仍钉在账户 #1(所以设置页必须走 _d())", pSel.settings.diaryFolder === "甲", pSel.settings.diaryFolder);
+    check("D18-5 a2 的 writer 按 a2 的新 folder 出路径", pSel.writers.a2.diaryPath(today) === "乙改/2026/2026-09-10.md", pSel.writers.a2.diaryPath(today));
+
+    console.log("  — D18-5.8 设置页的同树校验: 认当前账户, 也认指定账户(行内 folder 选择器)");
+    check("D18-5 当前是 a2, 候选 folder 撞 a1 → 报错并点名 a1",
+      (() => { const r = tab._treeConflict({ diaryFolder: "甲", pathFormat: "YYYY-MM-DD" }); return !!r && String(r.error).includes("账户 1"); })(),
+      JSON.stringify(tab._treeConflict({ diaryFolder: "甲", pathFormat: "YYYY-MM-DD" })));
+    check("D18-5 不撞的候选 → 放行", tab._treeConflict({ diaryFolder: "丙", pathFormat: "YYYY-MM-DD" }) === null,
+      JSON.stringify(tab._treeConflict({ diaryFolder: "丙", pathFormat: "YYYY-MM-DD" })));
+    check("D18-5 行内 folder 选择器按账户 id 查(与当前选中谁无关)", (() => {
+      const r = tab._treeConflictFor("a1", { diaryFolder: "乙改", pathFormat: "YYYY/YYYY-MM-DD" });
+      return !!r && String(r.error).includes("账户 2");
+    })(), JSON.stringify(tab._treeConflictFor("a1", { diaryFolder: "乙改", pathFormat: "YYYY/YYYY-MM-DD" })));
+
+    console.log("  — D18-5.9 单账户解绑/重绑: 只动这一个账户");
+    const sUn = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + ":a2"]: "TOK-B" };
+    const pUn = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" }, sUn);
+    pUn.data.accounts[1].diary.reminderTime = "22:30";
+    await pUn.unbindAccount("a2", false);
+    check("D18-5 解绑 a2: 凭据清空、回到 none", pUn.getBotToken("a2") === "" && pUn.bindState("a2") === "none", pUn.bindState("a2"));
+    check("D18-5 解绑 a2: 账户还在, diary 保住(文件夹/提醒配置不丢)",
+      pUn.data.accounts.length === 2 && pUn.data.accounts[1].diary.diaryFolder === "乙" && pUn.data.accounts[1].diary.reminderTime === "22:30",
+      JSON.stringify(pUn.data.accounts[1].diary));
+    check("D18-5 解绑 a2: a1 完全不受影响", pUn.getBotToken("a1") === "TOK-A" && pUn.bindState("a1") === "bound", JSON.stringify([pUn.getBotToken("a1"), pUn.bindState("a1")]));
+    await pUn.unbindAccount("a1", true);
+    check("D18-5 keepToken: a1 回到 half 且 token 保住, a2 仍不受影响",
+      pUn.bindState("a1") === "half" && pUn.getBotToken("a1") === "TOK-A" && pUn.bindState("a2") === "none",
+      JSON.stringify([pUn.bindState("a1"), pUn.getBotToken("a1"), pUn.bindState("a2")]));
+
+    console.log("  — D18-5.10 加载兜底: data.json 手改出同树 → 警告一次, 但不拒绝启动、不改数据");
+    const badStored = {
+      settings: { diaryFolder: "日记", timezone: "Asia/Shanghai" },
+      accounts: [
+        I.newAccount("a1", "工作号", { diaryFolder: "日记", pathFormat: "YYYY-MM-DD" }),
+        I.newAccount("a2", "生活号", { diaryFolder: "日记/", pathFormat: "YYYY-MM-DD" }),
+      ],
+      activeAccount: "a1",
+    };
+    const noticesBefore2 = notices.length;
+    const pBad = await newPlugin({}, badStored);
+    check("D18-5 同树不拒绝启动: 账户与服务都在", pBad.data.accounts.length === 2 && !!pBad.writers.a1 && !!pBad.writers.a2);
+    check("D18-5 给了警告且点名两个账户",
+      notices.slice(noticesBefore2).some((n) => n.includes("工作号") && n.includes("生活号")), JSON.stringify(notices.slice(noticesBefore2)));
+    check("D18-5 用户数据没有被改(还是他写的那两个 folder)",
+      pBad.data.accounts[0].diary.diaryFolder === "日记" && pBad.data.accounts[1].diary.diaryFolder === "日记/",
+      JSON.stringify(pBad.data.accounts.map((a) => a.diary.diaryFolder)));
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);
