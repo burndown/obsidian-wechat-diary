@@ -111,10 +111,24 @@ Object.defineProperty(this.data, "session", { get: () => this.data.accounts[0].s
 第 1 步天然行为中性。第 2/3 步按账户改完之后，把这三个垫片删掉，`data.json` 里也不再写旧字段。
 （旧字段在磁盘上的残留、以及旧的无后缀密钥，按 §3 末尾的原则保留到确认不需要回退为止。）
 
-**这一步的风险点**：垫片是 `defineProperty` 覆盖在合并后的 data 上——`persist()` 序列化
-`this.data` 时会**跳过 getter**（`JSON.stringify` 只取自有可枚举属性），所以迁移后的 `data.json`
-里不会再有 `ilink`/`profile`/`session` 三个键。这正好是我们要的，但要在用例里断言：
-迁移后落盘的 data.json 里这三键消失、`accounts[0]` 里有等价内容。
+**这一步的风险点**：垫片必须用 `enumerable: false`。`JSON.stringify` 只序列化**自有可枚举**属性，
+但它对可枚举的 getter **是会调用并序列化的**——不加这个开关，`ilink`/`profile`/`session`
+就会被原样写回 `data.json`，与"迁移后这三个键消失"的目标正好相反。用例断言落盘 JSON 的顶层没有这三个键。
+
+### 3.2 落地第 1 步时抓到的两个坑（第 2/3 步要记住）
+
+两个都是"账户层与既有代码怎么咬合"的问题，都不是设计阶段想到的，是测试抓出来的：
+
+1. **`unbind()` 会把 `this.data` 整个换成 `DEFAULT_DATA()`**（0.4.0 原代码，为了清干净状态）。
+   换完 `accounts` 空、垫片也没了 → 凭据写到空气里：**没有 `secretStorage` 的宿主上
+   `keepToken` 会静默失效**（token 落在兜底字段的路径断了），后续 `session` 写入还会抛异常。
+   修法：把"迁移 + 兜底账户 + 装垫片"抽成 `_installAccounts()`，`onload` 与 `unbind` 两处都必须走它。
+   → 第 2/3 步再遇到"重置 data"的地方（如果有），同样要记得重装账户层。
+2. **`onload` 的 data 字面量必须把 `stored.accounts` 带过来**。漏了它，`migrateAccounts` 会以为
+   这是老数据而**重新迁移一次**：`profile`/`session` 当场丢光（用户的称呼、提醒记账全没），
+   只有 token 会从密钥回填——症状是"看起来还能用，但设置和状态被悄悄重置"。
+   用例【D18】的"二次启动幂等"就是盯这个的。
+
 
 
 ## 4. 运行时结构

@@ -2343,6 +2343,23 @@ const SECRET_AI_KEY = "wechat-diary-ai-api-key";
 // 生命周期一致: data.json 会被卸载删掉、被同步盘回滚, secret 不会。两半分家就是 v0.2.1
 // 修的那个"半绑定"故障的根源(见 00-decisions.md D5 补记)。
 const SECRET_BIND_ID = "wechat-diary-bind-identity";
+// ── D18(多账户)第 1 步: 凭据按账户分层 ────────────────────────────────────
+// 密钥 key 加账户后缀。**旧的无后缀 key 保留不动**(0.4.0 的代码只认它): 万一用户回退到 0.4.0,
+// 绑定照样能用。第一个账户读不到新 key 时回落到旧 key, 于是"老用户无感升级"不需要拷贝密钥。
+// 第二个账户**绝不回落** —— 否则它会拿到第一个账户的 token。
+const ACCOUNT_TOKEN_KEY = (id) => SECRET_BOT_TOKEN + ":" + id;
+const ACCOUNT_IDENTITY_KEY = (id) => SECRET_BIND_ID + ":" + id;
+const FIRST_ACCOUNT_ID = "a1";
+// 老 data.json 里这几个"日记设置"字段从第 2 步起归每个账户所有(docs/18 §2)。
+// 第 1 步先把它们原样拷进账户, writer/clipper/提醒仍然读全局那份 —— 行为一字不变。
+const ACCOUNT_DIARY_FIELDS = [
+  "diaryFolder", "pathFormat",
+  "attachmentMode", "attachmentFolder", "attachmentSubFormat",
+  "sharedDailyNote", "sectionHeading", "templatePath",
+  "reminderEnabled", "reminderTime",
+  "webClipEnabled", "webClipOtherSites", "webClipFolder", "webClipSaveImages",
+  "webClipMaxImages", "webClipMaxTotalImageMb", "webClipMaxChars",
+];
 
 const LONG_POLL_TIMEOUT_MS = 35000;
 const SEND_TIMEOUT_MS = 15000;
@@ -6696,7 +6713,81 @@ const DEFAULT_DATA = () => ({
     // (写入即清零, ≥3 闭嘴等人回来); reminder_idx=文案轮换指针; reminder_last_result=最近一次发送结果(诊断用)
     reminded_date: "", reminder_streak: 0, reminder_idx: 0, reminder_last_result: "",
   },
+  // ── D18 多账户 ──
+  // 每个账户自带: 凭据/管道状态(botId/userId/baseUrl/buf/contextTokens/…)、习惯状态(profile/session)、
+  // 以及一整套日记设置(diary, 见 ACCOUNT_DIARY_FIELDS)。
+  // 第 1 步: 老的单账户数据在 onload 里**迁移**成 accounts[0]; 旧的 ilink/profile/session 变成
+  // 指向它的视图(installAccountShim), 所以 26 处 data.ilink 引用与所有 session/profile 读写一行都不用动。
+  accounts: [],
+  activeAccount: "",   // 设置页当前选中哪个账户(只影响 UI, 不影响行为)
 });
+
+// ── D18 账户层: 纯函数(表驱动可测, bindtest 走 __internals)─────────────────────
+
+// 把全局设置里属于"日记"的那一组原样拷进账户。**含 undefined 也原样拷, 不在这里解析默认值**:
+// 读的地方(第 2 步的 writer/clipper/提醒)会沿用与今天一模一样的 `|| 默认` / `=== true` / `!== false`
+// 表达式, 这样迁移后行为逐字不变, 也不会把某个默认值"焊死"在账户里(将来改默认值仍能生效)。
+function accountDiaryFromSettings(settings) {
+  const s = settings || {};
+  const out = {};
+  for (const k of ACCOUNT_DIARY_FIELDS) out[k] = s[k];
+  return out;
+}
+
+// 一个全新的空账户。第 1 步只用来兜底(全新安装没有任何老数据时造一个, 让垫片有东西可指);
+// 第 5 步"添加账户"会用它。
+// 形状刻意与今天的 data 对称: account.ilink / account.profile / account.session 一一对应
+// data.ilink / data.profile / data.session —— 于是垫片是纯转发, 没有字段映射的暗坑。
+function newAccount(id, label, diary) {
+  const base = DEFAULT_DATA();
+  return {
+    id: id || FIRST_ACCOUNT_ID,
+    label: label || "账户 1",
+    diary: diary || {},
+    ilink: Object.assign({}, base.ilink),
+    profile: Object.assign({}, base.profile),
+    session: Object.assign({}, base.session),
+  };
+}
+
+// 老的单账户 data → accounts[]。**纯函数**(不碰 secretStorage、不写盘), 便于表驱动测试。
+// 返回 { accounts, migrated }: migrated = 这次真的迁移了(调用方据此落盘一次)。
+// hasLegacyToken: 旧的**无后缀**密钥里有没有 token —— data.json 可能丢过而密钥还在(卸载重装、
+// 同步盘回滚, 见 D5), 那种"半绑定"状态同样要迁移, 否则用户会看到未绑定。
+function migrateAccounts(legacy, opts) {
+  const o = opts || {};
+  const src = legacy || {};
+  if (Array.isArray(src.accounts) && src.accounts.length) {
+    return { accounts: src.accounts, migrated: false };   // 已经是新形态, 不动
+  }
+  const il = src.ilink || {};
+  const hasTrace = !!(il.userId || il.botId || il.buf || (il.recentSeqs && il.recentSeqs.length) || o.hasLegacyToken);
+  if (!hasTrace) return { accounts: [], migrated: false };  // 全新安装: 不凭空造账户
+
+  const acct = newAccount(FIRST_ACCOUNT_ID, "账户 1", accountDiaryFromSettings(o.settings));
+  acct.ilink = Object.assign(acct.ilink, il);
+  if (src.profile && typeof src.profile === "object") acct.profile = Object.assign(acct.profile, src.profile);
+  if (src.session && typeof src.session === "object") acct.session = Object.assign(acct.session, src.session);
+  return { accounts: [acct], migrated: true };
+}
+
+// 第 1 步的兼容垫片: 把 data.ilink / data.profile / data.session 变成指向 accounts[0] 的**纯转发**,
+// 让既有的 26 处 data.ilink 引用与所有 session/profile 读写一行都不用改
+// (第 2/3 步按账户改完就把这段删掉)。
+// ⚠️ 必须 enumerable:false —— JSON.stringify 只序列化可枚举自有属性, 但**会调用 getter**;
+// 可枚举的话这三个键就会被写回 data.json, 与"迁移后这三个键消失"的目标正好相反。
+// 用例【D18】断言落盘的 json 里没有这三个键。
+function installAccountShim(data) {
+  const first = () => (data.accounts && data.accounts[0]) || null;
+  for (const k of ["ilink", "profile", "session"]) {
+    Object.defineProperty(data, k, {
+      configurable: true,
+      enumerable: false,   // 见上
+      get() { const a = first(); return a ? a[k] : undefined; },
+      set(v) { const a = first(); if (a) a[k] = v; },
+    });
+  }
+}
 
 class WechatDiaryPlugin extends Plugin {
   async onload() {
@@ -6709,6 +6800,10 @@ class WechatDiaryPlugin extends Plugin {
       ilink: Object.assign(base.ilink, stored.ilink),
       profile: Object.assign(base.profile, stored.profile),
       session: Object.assign(base.session, stored.session),
+      // D18: 账户层**必须从盘上带过来** —— 漏了它 migrateAccounts 会以为这是老数据, 二次启动
+      // 重新迁移一次: profile/session 当场丢光(用户的称呼、提醒记账全没), 只剩 token 从密钥回填。
+      accounts: Array.isArray(stored.accounts) ? stored.accounts : base.accounts,
+      activeAccount: stored.activeAccount || "",
     };
     // D11: 取名轮退役——老 data.json 里滞留在 awaiting_name 的迁移为 active
     if (this.data.profile.state === "awaiting_name") this.data.profile.state = "active";
@@ -6716,6 +6811,10 @@ class WechatDiaryPlugin extends Plugin {
     setTimezone(this.settings.timezone);
     setDayStartHour(this.settings.dayStartHour);
     setNudgeNightHour(this.settings.nudgeNightHour);
+
+    // ── D18(多账户)第 1 步: 账户层 ──
+    // 老的单账户数据整份迁进 accounts[0]; 旧的无后缀密钥**不动**(回退到 0.4.0 时绑定照样能用)。
+    if (this._installAccounts()) await this.persist();   // 迁移结果落盘一次
 
     // data.json 丢了但 token 还在(卸载重装/同步盘回滚)时, 从 secret 里把身份取回来。
     // 顺序在 setTimezone 之后、管道启动之前, 让后面所有判断看到的都是补全过的状态。
@@ -6835,16 +6934,64 @@ class WechatDiaryPlugin extends Plugin {
 
   _secrets() { return this.app.secretStorage || null; }
 
-  getBotToken() {
+  _legacySecret(key) {
     const ss = this._secrets();
-    if (ss) { const v = ss.getSecret(SECRET_BOT_TOKEN); if (v) return v; }
-    return this.data.ilink.botTokenFallback || "";
+    return ss ? (ss.getSecret(key) || "") : "";
   }
 
-  setBotToken(token) {
+  // ── 账户查询(D18) ──
+  // 装账户层: 迁移老数据 + 造兜底账户 + 装垫片。**onload 与 unbind(重置 data)两处都必须走它** ——
+  // unbind 会把 this.data 整个换成 DEFAULT_DATA(), 不重装的话 accounts 空掉、垫片也没了:
+  // 没有 secretStorage 的宿主上 token 会写进空气里(keepToken 静默失效), 后续 session/profile 写入会崩。
+  // 返回是否发生了迁移(调用方据此落盘一次)。
+  _installAccounts() {
+    const mig = migrateAccounts(this.data, {
+      hasLegacyToken: !!this._legacySecret(SECRET_BOT_TOKEN),
+      settings: this.settings,
+    });
+    this.data.accounts = mig.accounts.length
+      ? mig.accounts
+      : [newAccount(FIRST_ACCOUNT_ID, "账户 1", accountDiaryFromSettings(this.settings))];
+    this.data.activeAccount = this.data.activeAccount || this.data.accounts[0].id;
+    installAccountShim(this.data);   // 必须在迁移之后: 迁移读的是还在 data 上的旧字段
+    return mig.migrated;
+  }
+
+  firstAccount() { const l = this.data.accounts || []; return l.length ? l[0] : null; }
+  accountById(id) { return (this.data.accounts || []).find((a) => a && a.id === id) || null; }
+  // 不带 id 的调用一律落在"当前账户"上: 第 1 步只有一个账户, 所以与今天的行为完全一致;
+  // 第 2/3 步起调用方会显式传账户。
+  activeAccountId() {
+    const cur = this.data.activeAccount;
+    if (cur && this.accountById(cur)) return cur;
+    const f = this.firstAccount();
+    return (f && f.id) || FIRST_ACCOUNT_ID;
+  }
+
+  getBotToken(id) {
+    const aid = id || this.activeAccountId();
     const ss = this._secrets();
-    if (ss) { ss.setSecret(SECRET_BOT_TOKEN, token || ""); this.data.ilink.botTokenFallback = ""; }
-    else this.data.ilink.botTokenFallback = token || "";
+    if (ss) {
+      const v = ss.getSecret(ACCOUNT_TOKEN_KEY(aid));
+      if (v) return v;
+      // 只有第一个账户回落到旧的无后缀 key(老用户升级无感)。第二个账户**绝不回落** ——
+      // 否则它会拿到第一个账户的 token, 那是"两个微信号串号"级别的事故。
+      if (aid === FIRST_ACCOUNT_ID) { const old = ss.getSecret(SECRET_BOT_TOKEN); if (old) return old; }
+    }
+    const acct = this.accountById(aid);
+    return (acct && acct.ilink.botTokenFallback) || "";
+  }
+
+  setBotToken(token, id) {
+    const aid = id || this.activeAccountId();
+    const ss = this._secrets();
+    const acct = this.accountById(aid);
+    if (ss) {
+      ss.setSecret(ACCOUNT_TOKEN_KEY(aid), token || "");
+      // 解绑(写空)时把旧 key 一起清掉: 否则 getBotToken 会从旧 key 回落, 刚解绑的绑定当场"复活"
+      if (!token && aid === FIRST_ACCOUNT_ID) ss.setSecret(SECRET_BOT_TOKEN, "");
+      if (acct) acct.ilink.botTokenFallback = "";
+    } else if (acct) acct.ilink.botTokenFallback = token || "";
   }
 
   getAiKey() {
@@ -6860,22 +7007,32 @@ class WechatDiaryPlugin extends Plugin {
   }
 
   // 绑定身份的副本, 与 token 同库。data.json 没了(卸载/同步盘回滚)时靠它无感恢复。
-  getBindIdentity() {
+  // D18: 按账户读, 第一个账户回落到旧的单账户 key(与 getBotToken 同一条规则)。
+  getBindIdentity(id) {
+    const aid = id || this.activeAccountId();
     const ss = this._secrets();
     if (!ss) return null;
-    try {
-      const raw = ss.getSecret(SECRET_BIND_ID);
-      if (!raw) return null;
-      const o = JSON.parse(raw);
-      return o && o.userId ? o : null;
-    } catch (e) { return null; }   // 手改坏了就当没有, 不能让它挡住启动
+    const read = (k) => {
+      try {
+        const raw = ss.getSecret(k);
+        if (!raw) return null;
+        const o = JSON.parse(raw);
+        return o && o.userId ? o : null;
+      } catch (e) { return null; }   // 手改坏了就当没有, 不能让它挡住启动
+    };
+    return read(ACCOUNT_IDENTITY_KEY(aid)) || (aid === FIRST_ACCOUNT_ID ? read(SECRET_BIND_ID) : null);
   }
 
-  setBindIdentity(userId, botId, baseUrl) {
+  setBindIdentity(userId, botId, baseUrl, id) {
+    const aid = id || this.activeAccountId();
     const ss = this._secrets();
     if (!ss) return;
-    if (!userId) { ss.setSecret(SECRET_BIND_ID, ""); return; }
-    ss.setSecret(SECRET_BIND_ID, JSON.stringify({ userId, botId: botId || "", baseUrl: baseUrl || "" }));
+    if (!userId) {
+      ss.setSecret(ACCOUNT_IDENTITY_KEY(aid), "");
+      if (aid === FIRST_ACCOUNT_ID) ss.setSecret(SECRET_BIND_ID, "");   // 解绑时旧副本一起清(token 同理)
+      return;
+    }
+    ss.setSecret(ACCOUNT_IDENTITY_KEY(aid), JSON.stringify({ userId, botId: botId || "", baseUrl: baseUrl || "" }));
   }
 
   // 三态: bound(可用) / half(有凭据缺主人, 待认领) / none。
@@ -6968,6 +7125,7 @@ class WechatDiaryPlugin extends Plugin {
     this.data = DEFAULT_DATA();
     this.data.settings = keep;
     this.settings = keep;
+    this._installAccounts();   // D18: data 被整个换掉了, 账户层与垫片要重装(见 _installAccounts)
     // 必须在重置 data 之后写: 没有 secretStorage 的宿主上 token 就落在 data.ilink 里,
     // 先写会被 DEFAULT_DATA() 抹掉 —— keepToken 会变成静默失效。
     this.setBotToken(token);
@@ -7380,6 +7538,10 @@ WechatDiaryPlugin.__internals = {
   safeClipFilename, formatWebClipMarkdown, requestWebClipBinaryDirect, webClipMaxImages, webClipMaxTotalImageBytes, WebClipper, WebClipError,
   texts2: { REMINDER_LINES, FILE_DUP_KEY_REPLY, FILE_TOO_BIG_REPLY, VOICE_FALLBACK_FAIL_REPLY,
     VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
+  // D18 账户层(第 1 步)
+  migrateAccounts, accountDiaryFromSettings, newAccount, installAccountShim,
+  ACCOUNT_DIARY_FIELDS, FIRST_ACCOUNT_ID, ACCOUNT_TOKEN_KEY, ACCOUNT_IDENTITY_KEY,
+  DEFAULT_DATA,
 };
 
 module.exports = WechatDiaryPlugin;

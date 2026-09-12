@@ -166,8 +166,10 @@ async function newPlugin(secrets, storedData) {
   console.log("\n【2】扫码绑定成功");
   await p.onLoginConfirmed({ botToken: "TOK1", botId: "B1", userId: "U1", baseUrl: "https://x.example" });
   check("bindState() === bound", p.bindState() === "bound", p.bindState());
-  check("token 进了 secretStorage", s1[SECRET_TOKEN] === "TOK1");
-  check("身份也进了 secretStorage", !!s1[SECRET_ID], JSON.stringify(s1[SECRET_ID]));
+  // D18: 凭据按账户分层(key 加 :a1 后缀); 旧的无后缀 key 不写, 留给"回退到 0.4.0 仍能用"
+  check("token 进了 secretStorage(账户 key)", s1[SECRET_TOKEN + ":a1"] === "TOK1", JSON.stringify(s1[SECRET_TOKEN + ":a1"]));
+  check("不再往旧的无后缀 key 写 token", s1[SECRET_TOKEN] === undefined, JSON.stringify(s1[SECRET_TOKEN]));
+  check("身份也进了 secretStorage(账户 key)", !!s1[SECRET_ID + ":a1"], JSON.stringify(s1[SECRET_ID + ":a1"]));
   check("身份内容正确", (p.getBindIdentity() || {}).userId === "U1");
   const dataAfterBind = p._stored;
 
@@ -177,7 +179,7 @@ async function newPlugin(secrets, storedData) {
   check("bindState() === bound (不是 half)", p.bindState() === "bound", p.bindState());
   check("baseUrl 也恢复了", p.data.ilink.baseUrl === "https://x.example");
   check("置了 skipBacklog(防积压重放)", p._skipBacklog === true);
-  check("skipBacklog 已落盘(跨重启有效)", p._stored.ilink.skipBacklog === true);
+  check("skipBacklog 已落盘(跨重启有效)", p._stored.accounts[0].ilink.skipBacklog === true, JSON.stringify(Object.keys(p._stored)));
   pendingLayout.forEach((cb) => cb());
   check("管道启动了", p._startedPipeline === true);
 
@@ -188,7 +190,7 @@ async function newPlugin(secrets, storedData) {
   check("计数 +1", p._skippedCount === 1, String(p._skippedCount));
   await p._clearSkipBacklog();
   check("解除后 _skipBacklog=false", p._skipBacklog === false);
-  check("解除后落盘也翻了", p._stored.ilink.skipBacklog === false);
+  check("解除后落盘也翻了", p._stored.accounts[0].ilink.skipBacklog === false);
   check("提示了用户", notices.some((n) => n.includes("已跳过离线期间的 1 条")), JSON.stringify(notices.slice(-2)));
 
   console.log("\n【5】v0.1.3 老用户升上来: data.json 没了, secret 里【没有】身份副本");
@@ -218,7 +220,7 @@ async function newPlugin(secrets, storedData) {
   check("userId 认回来了", p.data.ilink.userId === "U1");
   check("bindState() === bound", p.bindState() === "bound", p.bindState());
   check("身份补写进了 secret", (p.getBindIdentity() || {}).userId === "U1");
-  check("认领后进入 skipBacklog(防积压落笔)", p._skipBacklog === true && p._stored.ilink.skipBacklog === true);
+  check("认领后进入 skipBacklog(防积压落笔)", p._skipBacklog === true && p._stored.accounts[0].ilink.skipBacklog === true);
   await p._clearSkipBacklog();
   check("一次空轮询即解除", p._skipBacklog === false);
   await p.adoptOwner("HACKER");
@@ -1508,6 +1510,131 @@ async function newPlugin(secrets, storedData) {
     check("D14 老 data.json 升级: 没设过 → 语音原声开", pOld.settings.saveVoiceAudio === true, String(pOld.settings.saveVoiceAudio));
     const pSet = await newPlugin({}, { settings: { diaryFolder: "日记", webClipEnabled: true, saveVoiceAudio: false } });
     check("D14 用户明确设过的值不被默认值覆盖", pSet.settings.webClipEnabled === true && pSet.settings.saveVoiceAudio === false);
+  }
+
+  console.log("\n【D18】账户层(多账户第 1 步): 迁移 / 垫片 / 凭据分层——**行为中性**");
+  {
+    console.log("  — D18.1 纯函数: migrateAccounts");
+    const LEGACY = {
+      ilink: { botId: "B1", userId: "U1", baseUrl: "https://x", buf: "CUR1", contextTokens: { U1: "c1" },
+        recentSeqs: [1, 2], pauseUntil: 123, lastAliveTs: 456, loginTime: "t0", botTokenFallback: "", skipBacklog: true },
+      profile: { state: "active", name: "小明", finalize_count: 3, nudge_count: 1 },
+      session: { mode: "chat", entered_date: "2026-09-01", chat_count_today: 2, last_activity_ts: 9,
+        cost_reminder_shown_date: "", nudged_date: "2026-09-01", reminded_date: "2026-09-02",
+        reminder_streak: 1, reminder_idx: 2, reminder_last_result: "ok" },
+    };
+    const ds = { diaryFolder: "我的日记", pathFormat: "YYYY/MM/DD", attachmentMode: "custom",
+      attachmentFolder: "x/att", attachmentSubFormat: "YYYY", sharedDailyNote: true,
+      sectionHeading: "随手记", templatePath: "tpl.md",
+      reminderEnabled: false, reminderTime: "20:00",
+      webClipEnabled: true, webClipOtherSites: true, webClipFolder: "x/剪藏", webClipSaveImages: false,
+      webClipMaxImages: 5, webClipMaxTotalImageMb: 15, webClipMaxChars: 1000 };
+    const m1 = I.migrateAccounts(Object.assign({}, LEGACY, { settings: ds }),
+      { hasLegacyToken: false, settings: ds });
+    check("D18 迁移发生", m1.migrated === true && m1.accounts.length === 1, JSON.stringify(m1.migrated));
+    const a0 = m1.accounts[0];
+    check("D18 账户 id = a1 且 label 可读", a0.id === I.FIRST_ACCOUNT_ID && a0.label === "账户 1");
+    check("D18 凭据整份搬进 account.ilink", a0.ilink.userId === "U1" && a0.ilink.buf === "CUR1" &&
+      a0.ilink.botId === "B1" && a0.ilink.skipBacklog === true && a0.ilink.contextTokens.U1 === "c1" &&
+      a0.ilink.pauseUntil === 123 && a0.ilink.lastAliveTs === 456 && a0.ilink.loginTime === "t0", JSON.stringify(a0.ilink));
+    check("D18 profile 整份搬进来", a0.profile.name === "小明" && a0.profile.finalize_count === 3 && a0.profile.state === "active", JSON.stringify(a0.profile));
+    check("D18 session 整份搬进来(含提醒记账)", a0.session.reminded_date === "2026-09-02" &&
+      a0.session.reminder_idx === 2 && a0.session.nudged_date === "2026-09-01" && a0.session.chat_count_today === 2, JSON.stringify(a0.session));
+    // 日记设置逐字段照搬(含"没设过"的语义: 原样拷贝 undefined, 不在这里解析默认值)
+    let diaryOk = true, diaryBad = "";
+    for (const k of I.ACCOUNT_DIARY_FIELDS) {
+      if (a0.diary[k] !== ds[k]) { diaryOk = false; diaryBad = k + ": " + JSON.stringify(a0.diary[k]) + " != " + JSON.stringify(ds[k]); break; }
+    }
+    check("D18 账户 diary 里 " + I.ACCOUNT_DIARY_FIELDS.length + " 个字段逐字段等于全局值", diaryOk, diaryBad);
+    const undef = I.migrateAccounts(Object.assign({}, LEGACY, { settings: {} }), { settings: {} });
+    check("D18 没设过的字段原样保持 undefined(不把默认值焊死在账户里)",
+      undef.accounts[0].diary.webClipEnabled === undefined && undef.accounts[0].diary.diaryFolder === undefined,
+      JSON.stringify(undef.accounts[0].diary));
+    check("D18 全新安装: 不凭空造账户", I.migrateAccounts({}, {}).accounts.length === 0 && I.migrateAccounts({}, {}).migrated === false);
+    check("D18 有旧密钥但 data.json 空了(半绑定): 照样迁移", I.migrateAccounts({}, { hasLegacyToken: true }).accounts.length === 1);
+    const m2 = I.migrateAccounts({ accounts: [{ id: "a1" }] }, {});
+    check("D18 已是新形态 → 不动、不重复迁移", m2.migrated === false && m2.accounts.length === 1);
+    check("D18 迁移是纯函数(不改入参)", LEGACY.ilink.userId === "U1" && LEGACY.accounts === undefined);
+    check("D18 newAccount 形状与 data 对称", (() => {
+      const na = I.newAccount("a2", "账户 2", {});
+      return na.id === "a2" && na.label === "账户 2" && !!na.ilink && !!na.profile && !!na.session &&
+        na.ilink.userId === "" && na.profile.state === "unknown" && na.session.reminder_idx === 0;
+    })());
+
+    console.log("  — D18.2 垫片: 旧引用一行不动, 且不落回 data.json");
+    const shimData = { accounts: [I.newAccount("a1", "账户 1", {})], activeAccount: "a1" };
+    I.installAccountShim(shimData);
+    check("D18 data.ilink 指向 accounts[0].ilink", shimData.ilink === shimData.accounts[0].ilink);
+    check("D18 data.profile / data.session 同理", shimData.profile === shimData.accounts[0].profile && shimData.session === shimData.accounts[0].session);
+    shimData.ilink.userId = "U9";                       // 旧写法: 直接往 data.ilink 上写
+    check("D18 往 data.ilink 上写落在账户上", shimData.accounts[0].ilink.userId === "U9");
+    shimData.session.reminded_date = "2026-09-10";
+    check("D18 往 data.session 上写落在账户上", shimData.accounts[0].session.reminded_date === "2026-09-10");
+    const json = JSON.stringify(shimData);
+    const parsed = JSON.parse(json);
+    check("D18 落盘 json 的顶层没有 ilink/profile/session 三个旧键",
+      !("ilink" in parsed) && !("profile" in parsed) && !("session" in parsed), JSON.stringify(Object.keys(parsed)));
+    check("D18 三个旧键不可枚举(JSON.stringify 不会调 getter 写回去)",
+      !Object.keys(shimData).includes("ilink") && !Object.keys(shimData).includes("profile") && !Object.keys(shimData).includes("session"),
+      JSON.stringify(Object.keys(shimData)));
+    check("D18 accounts 本身是正常可序列化的", json.includes('"accounts"') && json.includes('"U9"'), json.slice(0, 200));
+
+    console.log("  — D18.3 端到端迁移: 老用户升级后绑定不断、文件夹不变、落盘形状变新");
+    const sOld = { [SECRET_TOKEN]: "TOK-OLD", [SECRET_ID]: JSON.stringify({ userId: "U1", botId: "B1", baseUrl: "" }) };
+    const oldStored = {
+      settings: { diaryFolder: "老日记", pathFormat: "YYYY/MM", reminderEnabled: false, reminderTime: "20:00", webClipEnabled: true },
+      ilink: { botId: "B1", userId: "U1", baseUrl: "", buf: "CUR-OLD", recentSeqs: [7], skipBacklog: false },
+      profile: { state: "active", name: "老王", finalize_count: 2, nudge_count: 0 },
+      session: { reminded_date: "2026-09-08", reminder_streak: 1 },
+    };
+    const pOld = await newPlugin(sOld, oldStored);
+    check("D18 老用户仍是 bound", pOld.bindState() === "bound", pOld.bindState());
+    check("D18 token 从旧 key 回落读到(没有拷贝密钥)", pOld.getBotToken() === "TOK-OLD", pOld.getBotToken());
+    check("D18 身份从旧 key 回落读到", (pOld.getBindIdentity() || {}).userId === "U1");
+    check("D18 账户 #1 认领了老数据", pOld.data.accounts.length === 1 && pOld.data.accounts[0].ilink.buf === "CUR-OLD" &&
+      pOld.data.accounts[0].profile.name === "老王", JSON.stringify(pOld.data.accounts[0].profile));
+    check("D18 老文件夹进了账户 diary(D18 之后 writer 才改读它)", pOld.data.accounts[0].diary.diaryFolder === "老日记");
+    check("D18 全局 settings 仍然在(第 2 步之前 writer 读的还是它)", pOld.settings.diaryFolder === "老日记");
+    check("D18 迁移结果已落盘", !!pOld._stored.accounts && pOld._stored.accounts.length === 1);
+    check("D18 落盘里没有 ilink/profile/session",
+      !("ilink" in pOld._stored) && !("profile" in pOld._stored) && !("session" in pOld._stored),
+      JSON.stringify(Object.keys(pOld._stored)));
+    check("D18 旧 key 没被动过(回退到 0.4.0 仍能用)", sOld[SECRET_TOKEN] === "TOK-OLD" && !!sOld[SECRET_ID]);
+    const pOld2 = await newPlugin(sOld, JSON.parse(JSON.stringify(pOld._stored)));
+    check("D18 二次启动幂等: 不重复迁移、状态还在",
+      pOld2.data.accounts.length === 1 && pOld2.data.accounts[0].profile.name === "老王" && pOld2.bindState() === "bound");
+
+    console.log("  — D18.4 凭据隔离: 第二个账户绝不回落到第一个账户的 key");
+    const sIso = { [SECRET_TOKEN]: "TOK-A1", [SECRET_ID]: JSON.stringify({ userId: "U1", botId: "B1", baseUrl: "" }) };
+    const pIso = await newPlugin(sIso, oldStored);
+    check("D18 a1 回落到旧 key", pIso.getBotToken("a1") === "TOK-A1");
+    check("D18 a2 不回落(否则两个微信串号)—— 读到空", pIso.getBotToken("a2") === "", JSON.stringify(pIso.getBotToken("a2")));
+    check("D18 a2 的身份也不回落", pIso.getBindIdentity("a2") === null);
+    pIso.setBotToken("TOK-A2", "a2");
+    check("D18 a2 写自己的 key", sIso[SECRET_TOKEN + ":a2"] === "TOK-A2" && sIso[SECRET_TOKEN] === "TOK-A1", JSON.stringify(Object.keys(sIso)));
+    check("D18 a2 写入后 a1 不受影响", pIso.getBotToken("a1") === "TOK-A1" && pIso.getBotToken("a2") === "TOK-A2");
+    check("D18 不带 id 时落在当前账户(a1)", pIso.getBotToken() === "TOK-A1");
+    pIso.setBotToken("", "a1");   // 解绑 a1
+    check("D18 解绑把旧 key 一起清掉(否则回落会让刚解绑的绑定复活)",
+      sIso[SECRET_TOKEN + ":a1"] === "" && sIso[SECRET_TOKEN] === "", JSON.stringify(sIso));
+    check("D18 解绑 a1 后 a1 读到空、a2 不受影响", pIso.getBotToken("a1") === "" && pIso.getBotToken("a2") === "TOK-A2");
+
+    console.log("  — D18.5 unbind 重置 data 之后账户层仍在(没有 secretStorage 的宿主)");
+    const appNoSec = makeApp({});
+    appNoSec.secretStorage = null;
+    const pNo = new WechatDiaryPlugin(appNoSec);
+    pNo._stored = null;
+    pNo.startPipeline = function () { this._startedPipeline = true; };
+    await pNo.onload();
+    await pNo.onLoginConfirmed({ botToken: "TOK-F", botId: "B9", userId: "U9", baseUrl: "" });
+    await pNo.unbind(true);
+    check("D18 unbind 后账户层重装好了", pNo.data.accounts.length === 1 && pNo.data.accounts[0].id === "a1");
+    check("D18 unbind 后垫片还在(写 session 不会崩)", (() => {
+      try { pNo.data.session.reminded_date = "2026-09-10"; return pNo.data.accounts[0].session.reminded_date === "2026-09-10"; }
+      catch (e) { return false; }
+    })());
+    check("D18 unbind 后账户是空的(等人重新认领)", !pNo.data.accounts[0].ilink.userId && pNo.bindState() === "half", pNo.bindState());
+    check("D18 keepToken 保住了 token(无 secretStorage 的兜底路径)", pNo.getBotToken() === "TOK-F", pNo.getBotToken());
   }
 
   console.log("\n────────────────────────");
