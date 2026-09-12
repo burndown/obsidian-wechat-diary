@@ -30,7 +30,7 @@ data.accounts = [
   {
     id,                    // 稳定标识(生成后不变): "a1"/"a2"…; 密钥 key 与状态索引都用它
     label,                 // 用户可读名(设置页显示, 默认 "账户 1"), 同时是新账户文件夹的默认名
-    folder,                // 该账户的日记根(相对库), 各自独立的一棵树
+    diary: { ... },        // 该账户的一整套日记/附件/共用笔记/提醒/剪藏设置(见下)
     botId, userId, baseUrl, buf, contextTokens, recentSeqs, pauseUntil,
     lastAliveTs, loginTime, botTokenFallback, skipBacklog,
     profile: { state, name, finalize_count, nudge_count },
@@ -45,7 +45,8 @@ data.activeAccount = "<id>"   // 只影响设置页显示哪一个, 不影响行
 **密钥**（不进 vault，D5 的既有原则）：`wechat-diary-ilink-bot-token:<id>`、
 `wechat-diary-bind-identity:<id>`。旧的无后缀 key **保留不动**（见 §3）。
 
-**每个账户自带一整套日记设置**（2026-09-10 追加拍板：不只 folder，"日记格式什么的"也要各配各的）：
+**每个账户自带一整套日记与提醒设置**（2026-09-10 拍板：不只 folder——"日记格式什么的"也要各配各的；
+随后又拍板**提醒、剪藏也下放**）：
 
 ```js
 data.accounts[i].diary = {
@@ -53,25 +54,25 @@ data.accounts[i].diary = {
   pathFormat,                    // 路径格式(该账户)
   attachmentMode, attachmentFolder, attachmentSubFormat,   // 附件位置三件套
   sharedDailyNote, sectionHeading, templatePath,           // 共用每日笔记那一组
+  reminderEnabled, reminderTime,                            // 提醒：谁提醒、几点提醒
+  webClipEnabled, webClipOtherSites, webClipFolder, webClipSaveImages,
+  webClipMaxImages, webClipMaxTotalImageMb, webClipMaxChars, // 剪藏：开关与目录(目录默认跟着日记根)
 }
 ```
 
-理由：这几个字段本来就只被 `DiaryWriter` 消费（`_root()`/`_fmt()`/`_attachmentDir()`/`_shared()`/
-`_heading()`/`_createDayFile()`），而 writer 这次**本来就要按账户实例化**。既然已经按账户持有 writer，
-把这一组挂在账户上几乎不额外花钱，却能让"工作号按年/月分文件夹、生活号不分文件夹"这种诉求成立。
+理由：这一组字段本来就只被 `DiaryWriter` / `WebClipper` / `_reminderTick` 消费，而这三者这次**本来就要
+按账户跑**（writer 按账户实例化、clipper 按账户实例化、提醒按账户遍历）。既然已经按账户持有它们，
+把设置挂在账户上几乎不额外花钱，却让"工作号按年/月分文件夹、18:00 提醒、剪藏开；生活号不分文件夹、
+22:00 提醒、剪藏关"这种诉求成立。
 
-**仍然全局的东西**（不是偷懒，是它们卡在模块级状态上，见下）：
+**仍然全局的东西**（不是偷懒，是它们卡在模块级状态或跨账户共享语义上）：
 
 | 保持全局 | 为什么 |
 |---|---|
-| `timezone` | `setTimezone()` 写的是模块级 `_dateFmt/_timeFmt/_weekdayFmt`，`todayStr`/`hhmmStr`/`weekdayForDate` 全走它。要按账户就得把时区当参数穿进**每一条**时间调用（含 `renderPath`、段头、frontmatter）——那是动时间底座，收益（一个人跨时区写同一个库）远小于风险 |
-| `dayStartHour` / `nudgeNightHour` | 同样是模块级（`_dayStartHour`/`_nudgeNightHour`），被 `logicalTodayStr`/`isNightNow`/`reminderDue`/`isLateNight` 直接读。按账户下放要改这些纯函数的签名，连带影响所有"逻辑日"判定与既有测试基线 |
-| `fileMd5s` / `webClips` | 同一个文件/链接从任一账户发来都该复用已存的那份——与"谁的"无关，分开反而会重复存 |
+| `timezone` | `setTimezone()` 写的是模块级 `_dateFmt/_timeFmt/_weekdayFmt`，`todayStr`/`hhmmStr`/`weekdayForDate` 全走它。要按账户就得把时区当参数穿进**每一条**时间调用（含 `renderPath`、段头、frontmatter）——那是动时间底座，收益（一个人跨时区写同一个库）远小于风险。**本轮不动** |
+| `dayStartHour` / `nudgeNightHour` | 同样是模块级（`_dayStartHour`/`_nudgeNightHour`），被 `logicalTodayStr`/`isNightNow`/`reminderDue`/`isLateNight` 直接读。按账户下放要改这些纯函数的签名，连带影响所有"逻辑日"判定与既有测试基线。**本轮不动** |
+| `fileMd5s` / `webClips`（缓存） | 同一个文件/链接从任一账户发来都该复用已存的那份——与"谁的"无关，分开反而会重复存。注意区分：**剪藏的开关与目录下放了**（上表），这里说的是"已剪藏 URL → vault 路径"这份缓存 |
 
-**建议同批下放但要你确认的两项**（它们的读取点本来就在按账户跑的循环里，代价很小）：
-`reminderEnabled`/`reminderTime`（`_reminderTick` 这次按账户遍历，顺手读各自的）、
-`webClip*` 开关与剪藏目录（剪藏目录本来就默认跟着日记根走，`defaultWebClipFolder(settings)`）。
-待拍板项见 §7。
 
 
 ## 3. 升级迁移（最关键的一段：不能让老用户掉绑定）
@@ -93,13 +94,37 @@ data.accounts[i].diary = {
   等确认不需要回退之后再清理——那是一次单独的、明确的删除。
 - 账户 id 用 `a1`/`a2`…而不是用户可改的 label：label 改名不该让密钥 key 跟着动。
 
+### 3.1 兼容垫片（让第 1 步真的是"不改行为"）
+
+第 1 步之后，"唯一真相"是 `data.accounts`，但**管道、writer、agent 都还只有一个**（多份在 2/3 步才来）。
+如果第 1 步顺手把 26 处 `data.ilink` 引用全改掉，那就不是"纯加层"了，而是一次性大改。
+
+做法：第 1 步在 `onload` 里把迁移做掉，然后把三个旧字段变成**指向账户 #1 的视图**：
+
+```js
+Object.defineProperty(this.data, "ilink",   { get: () => this.data.accounts[0], configurable: true });
+Object.defineProperty(this.data, "profile", { get: () => this.data.accounts[0].profile, configurable: true });
+Object.defineProperty(this.data, "session", { get: () => this.data.accounts[0].session, configurable: true });
+```
+
+读与写都照旧（`this.data.ilink.userId = x` 也落在账户 #1 上），所以**管道/agent/提醒一行都不用动**，
+第 1 步天然行为中性。第 2/3 步按账户改完之后，把这三个垫片删掉，`data.json` 里也不再写旧字段。
+（旧字段在磁盘上的残留、以及旧的无后缀密钥，按 §3 末尾的原则保留到确认不需要回退为止。）
+
+**这一步的风险点**：垫片是 `defineProperty` 覆盖在合并后的 data 上——`persist()` 序列化
+`this.data` 时会**跳过 getter**（`JSON.stringify` 只取自有可枚举属性），所以迁移后的 `data.json`
+里不会再有 `ilink`/`profile`/`session` 三个键。这正好是我们要的，但要在用例里断言：
+迁移后落盘的 data.json 里这三键消失、`accounts[0]` 里有等价内容。
+
+
 ## 4. 运行时结构
 
 ```
 plugin
  ├─ accounts: Account[]                    ← 由 data.accounts 派生(每项带存取器)
  ├─ pipelines: { [id]: { client, running, failCount, noticedDown, pollSettledTs } }
- ├─ writers:   { [id]: DiaryWriter }       ← 每个账户一个, _root() 读该账户的 folder
+ ├─ writers:   { [id]: DiaryWriter }       ← 每个账户一个, 读该账户的 diary 设置
+ ├─ clippers:  { [id]: WebClipper }        ← 每个账户一个(剪藏开关与目录按账户, 见 §7-3)
  └─ agents:    { [id]: DiaryAgent }        ← 每个账户一个(profile/session 是账户私有的)
 ```
 
@@ -124,8 +149,10 @@ plugin
 - **单账户用户零影响**：迁移后 `folder` = 原 `diaryFolder`，路径、附件、剪藏、提醒行为全不变。
   回归基线：0.3.1 黄金文件回归（`tests/bindtest.js`【G】）必须仍然全过。
 - **共用每日笔记模式**（`sharedDailyNote`）**按账户各配**：每个账户的 `folder` 就是它自己那份
-  "每日笔记所在目录"，各写各的 `## 微信随手记` 一节（节标题也可各配）。想两个账户写进**同一份**
-  每日笔记，得把两个账户的 folder 与节标题填成一样——那就是"混在一起"，见 §7 第 1 条。
+  "每日笔记所在目录"，各写各的 `## 微信随手记` 一节（节标题也可各配）。
+  注意 §7-1 已拍板**两个账户不许指向同一个日记树**，所以"两个号写进同一份每日笔记"这个用法
+  是被拦掉的——如果以后确实要，那要单独设计"多账户写入同一文件"的归属标记（段头标明谁说的），
+  不属于本轮。
 - **删除账户**：只删该账户的数据/密钥/管道，不碰 vault 里已写的文件（与「撤回只删引用、不删附件」同一条纪律）。
 - **协议侧**：两个微信账户各自扫码绑定各自的 bot，各自一份 token —— 协议上没有共享状态需要处理。
 
@@ -144,34 +171,45 @@ plugin
 10. **每账户日记设置隔离**：A 改 `pathFormat` 不影响 B；A 用共用每日笔记模式、B 用独立文件模式可以并存；
     A 的 `attachmentMode`/自定义附件文件夹独立；改 A 的 folder 不影响 B 已写的历史文件。
 11. **迁移字段完整性**：账户 #1 的 `diary` 块逐字段等于迁移那一刻的全局值（folder / pathFormat /
-    附件三件 / 共用笔记那一组），老用户"渲染出的路径与升级前逐字节相同"——这条由【G】黄金回归兜底。
+    附件三件 / 共用笔记那一组 / 提醒两项 / 剪藏七项），老用户"渲染出的路径与升级前逐字节相同"
+    ——这条由【G】黄金回归兜底。另断言：迁移后落盘的 `data.json` 里 `ilink`/`profile`/`session`
+    三个旧键消失（垫片是 getter，`JSON.stringify` 会跳过），`accounts[0]` 里有等价内容（§3.1）。
+12. **同树拦截（两层）**：① 两个账户 folder 归一化后相同 → 拒；② folder 不同但渲染出的当天路径
+    相同（`日记`+`YYYY` vs `日记/2026`+`YYYY-MM-DD`）→ 拒；报错里要出现另一个账户的 label。
+13. **提醒/剪藏按账户**：A 关提醒、B 开 → 只提醒 B；A 的时间 18:00 生效而 B 的 22:00 不变；
+    A 剪藏开、B 关 → 只有 A 的链接会被抓；A 的剪藏目录跟着 A 的日记根。
 
 ## 7. 待定（实现前需要拍板）
 
-1. **两个账户能否填同一个 folder（以及同一套路径格式/共用节标题）？** 允许的话就是"混在一起"
-   （两个号写同一份日记），和"各自独立的树"的初衷相反。建议：**允许但设置页给出警告**
-   （"两个账户指向同一个文件夹，记录会混在一起"）——因为"我自己的两个号写同一份日记"是合理诉求。
-2. **`reminderEnabled` / `reminderTime` 下放到账户？** 建议**下放**：`_reminderTick` 这次本来就要按
-   账户遍历，各自读各自的；"工作号 18:00、生活号 22:00"是自然诉求。代价几乎为零。
-3. **`webClip*` 开关与剪藏目录下放到账户？** 建议**下放**：剪藏目录本来就默认跟着日记根走
-   （`defaultWebClipFolder(settings)`），目录必然要跟着账户；开关跟着走才一致。代价：`WebClipper`
-   要按账户实例化（与 writer 同一批改）。
-4. **时区 / 一天从几点开始 / 夜间提示起点：确认保持全局**（§2 已说明它们卡在模块级状态上）。
-   如果你确实要每账户不同，那是单独一轮"把时间底座改成可传参"的改动，我建议拆出去做。
+1. ✅ **两个账户不许指向同一个日记树——直接拦掉**（2026-09-10 拍板）。校验分两层，两层都要做：
+   - **① folder 唯一**：归一化后（去首尾 `/` 与空白）不许与其它账户相同。
+   - **② 渲染出的路径唯一**：只比 folder 不够——`folder=日记` + `pathFormat=YYYY` 与
+     `folder=日记/2026` + `pathFormat=YYYY-MM-DD` 会落到同一个文件。所以再用各账户自己的
+     `renderPath(pathFormat, 今天, moment)` 渲染当天路径比一次，撞了也拒。这一层直接复用既有的
+     `validatePathFormat` / `renderedPathError`，不新写渲染逻辑。
+   - 报错要说清**跟哪个账户撞的**（"与「工作号」的日记会写进同一个文件"），否则用户不知道改哪个。
+2. ✅ **`reminderEnabled` / `reminderTime` 下放**（2026-09-10 拍板）。`_reminderTick` 按账户遍历、
+   各读各自的时间与开关——"工作号 18:00、生活号 22:00"由此成立。
+3. ✅ **`webClip*` 开关与剪藏目录下放**（同日拍板）。代价是 `WebClipper` 要按账户实例化
+   （与 writer 同一批改），剪藏目录默认也跟着该账户的日记根走。
+4. ✅ **时区 / 一天从几点开始 / 夜间提示起点：保持全局**（§2 表里已写明它们卡在模块级状态上）。
+   确实要每账户不同的话，那是单独一轮"把时间底座改成可传参"的改动，不混在这次重构里。
 5. **账户数上限**：建议软上限 5 个（每条是一份并发长轮询，且设置页要能看）。
 6. **跨账户的"今天记了几段"**：`在吗` 只报自己账户的（③的必然结果），确认即可。
 7. 设置页账户列表是否显示每个账户的"最近一次收到消息时间"（诊断用，0.4.0 已有 `lastAliveTs`）。
 
 ## 8. 实现顺序（建议）
 
-1. **数据模型 + 迁移 + 凭据分层**（纯加层，不改任何行为：writer 仍读全局、管道仍是单条）→ 用例 1/2 全过，可先合。
-2. **每账户日记设置 + writer/agent 按账户**：`diary` 块（folder / pathFormat / 附件三件 / 共用笔记那一组）
-   落地，`DiaryWriter` 改读账户的 diary（全局那份成为"新账户默认值"），`DiaryAgent` 按账户实例化
-   → 用例 3/7/10/11。
+1. **数据模型 + 迁移 + 兼容垫片 + 凭据分层**（纯加层，不改任何行为：writer/clipper 仍读全局、
+   管道仍是单条，垫片让 26 处 `data.ilink` 引用一行都不用动）→ 用例 1/2/11 全过，可先合。
+2. **每账户设置 + writer/clipper/agent 按账户**：`diary` 块（日记五项 / 附件三件 / 共用笔记三件 /
+   提醒两项 / 剪藏七项）落地，`DiaryWriter` 与 `WebClipper` 改读账户的 diary（全局那份变成
+   "新账户默认值"），`DiaryAgent` 按账户实例化 → 用例 3/7/10/12。
 3. **管道按账户化**（`pipelines` 表 + `_handleIncoming(msg, account)` + 各自 `buf`/`pauseUntil`）
    → 用例 5/8/9。这一步风险最高（陌生人判定改错会让第二个账户完全收不到消息）。
-4. **提醒按账户化**（含 §7-2 的时间下放）→ 用例 6。
-5. **设置页重构**：账户列表 + 选中账户编辑它那一套 + 添加/删除/重绑 → 用例 4 + 手测扫码。
+4. **提醒按账户化**（各读各自的时间与开关）→ 用例 6/13。
+5. **设置页重构**：账户列表 + 选中账户编辑它那一套 + 添加/删除/重绑 + 两层同树校验
+   → 用例 4/12 + 手测扫码。
 
 每步一个提交，**第 1 步合进去不改变任何行为**，2 之后随时可停（第 2 步做完就已经"两个账户各写各的树"，
 只是还不能同时在线）。
