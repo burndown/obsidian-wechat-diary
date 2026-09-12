@@ -5467,6 +5467,18 @@ class DiaryAgent {
   // profile/session 解析到本 agent 的账户; 没有 account 时回落插件垫片(第 2 步两者等价)。
   get profile() { const a = this.account; return a && a.profile ? a.profile : this.plugin.data.profile; }
   get session() { const a = this.account; return a && a.session ? a.session : this.plugin.data.session; }
+  // D18 第 3 步: 附件去重表(fileMd5s)也存在账户的 ilink 上。§2 的表把 fileMd5s 列为"全局缓存",
+  // 但数据模型第 1 步已经把它放进了 account.ilink; 与其跨账户写第一个账户的字段(第二个账户
+  // 自己的表永远是空的), 不如按账户走 —— 与这条管道的其余状态一致。多账户下"同一份文件
+  // 从两个号发来"会各存一份, 这是本轮接受的代价, 记在报告里。
+  _ilink() { const a = this.account; return a && a.ilink ? a.ilink : this.plugin.data.ilink; }
+  // 下载媒体用的 ILinkClient 必须是**本账户管道**那一个(它带该账户的 token/baseUrl);
+  // 用 plugin._client(首个账户的兼容视图)会让第二个账户拿错凭据去下载。
+  _pipeClient() {
+    const a = this.account;
+    const pipe = a && this.plugin.pipelines ? this.plugin.pipelines[a.id] : null;
+    return (pipe && pipe.client) || (a ? null : this.plugin._client);
+  }
 
   _welcome() { return this.writer._shared() ? welcomeTextShared(this.writer._heading()) : welcomeText(this._st("diaryFolder") || "日记"); }
 
@@ -5514,7 +5526,7 @@ class DiaryAgent {
 
   // 语音原声块: 下载 → SILK 解码 WAV → 「🎤 ![[..wav]] + 转写文字」一块落库。失败返回 null(调用方降级)。
   async _writeVoiceEntry(text, v, dateStr) {
-    const client = this.plugin._client;
+    const client = this._pipeClient();
     if (!client) return null;
     try {
       const raw = await client.downloadMedia(v, true);
@@ -5601,7 +5613,7 @@ class DiaryAgent {
   // 下载并写入一批图片。一张失败不连累其余。
   async _writeImages(images, dateStr) {
     this.session.last_activity_ts = Date.now();
-    const client = this.plugin._client;
+    const client = this._pipeClient();
     if (!client) return IMAGE_FAIL_REPLY;
     let ok = 0, failed = 0, lastN = 0, lastSealed = false, diskFull = false;
     for (const img of images) {
@@ -5630,7 +5642,7 @@ class DiaryAgent {
   // 语音兜底: 转写失败但有原音频 → 下载存附件("什么都别丢", D10)。返回回执, 永不抛。
   async _writeVoiceFallback(v, dateStr) {
     this.session.last_activity_ts = Date.now();
-    const client = this.plugin._client;
+    const client = this._pipeClient();
     if (!client) return VOICE_FALLBACK_FAIL_REPLY;
     try {
       const buf = await client.downloadMedia(v, true);
@@ -5654,7 +5666,7 @@ class DiaryAgent {
   // 靠"md5 见过 → 直接引用本地那份"绕过。返回回执, 永不抛。
   async _writeFileItem(fi, isVideo, dateStr) {
     this.session.last_activity_ts = Date.now();
-    const client = this.plugin._client;
+    const client = this._pipeClient();
     if (!client) return isVideo ? VIDEO_FAIL_REPLY : FILE_FAIL_REPLY;
     const day = dateStr || logicalTodayStr();
     const md5 = String((isVideo ? fi.video_md5 : fi.md5) || "").toLowerCase();
@@ -5696,7 +5708,7 @@ class DiaryAgent {
   }
 
   _findKnownMd5(md5) {
-    const il = this.plugin.data.ilink;
+    const il = this._ilink();
     const list = Array.isArray(il.fileMd5s) ? il.fileMd5s : [];
     for (let i = list.length - 1; i >= 0; i--) {
       if (list[i] && list[i].md5 === md5) {
@@ -5708,7 +5720,7 @@ class DiaryAgent {
   }
 
   _rememberMd5(md5, path) {
-    const il = this.plugin.data.ilink;
+    const il = this._ilink();
     if (!Array.isArray(il.fileMd5s)) il.fileMd5s = [];
     il.fileMd5s.push({ md5, path });
     if (il.fileMd5s.length > 200) il.fileMd5s.splice(0, il.fileMd5s.length - 200);
@@ -5888,8 +5900,10 @@ class DiaryAgent {
 
   // 入口: 白名单兜底 → 路由 → 离线提示一次性附注
   async onMessage(fromUserId, text, isVoice, images, extras) {
-    // 陌生人静默丢弃(_handleIncoming 已挡, 这里兜底): 回复等于向未授权者确认 bot 存活
-    if (fromUserId !== this.plugin.data.ilink.userId) return null;
+    // 陌生人静默丢弃(_handleIncoming 已挡, 这里兜底): 回复等于向未授权者确认 bot 存活。
+    // D18: 基准是本 agent 自己账户的主人, 不是全局垫片 —— 否则第二个账户的消息在这里被兜底丢掉。
+    const owner = this.account ? this.account.ilink.userId : this.plugin.data.ilink.userId;
+    if (fromUserId !== owner) return null;
     let reply = await this._dispatch(text, isVoice, images || [], extras || null);
     if (reply && this.offlineNotice) {
       reply = reply + "\n\n" + this.offlineNotice;
@@ -5913,9 +5927,12 @@ class DiaryAgent {
 // ── 扫码绑定 Modal ───────────────────────────────────────────────────────
 
 class QrLoginModal extends Modal {
-  constructor(app, plugin) {
+  // accountId: 扫码结果写进哪个账户槽。不传 = 首个账户(设置页第 5 步之前仍是单账户视图);
+  // 第 5 步"添加账户"传新账户 id, "重新扫码"传原账户 id —— 重绑就写回原槽。
+  constructor(app, plugin, accountId) {
     super(app);
     this.plugin = plugin;
+    this.accountId = accountId || null;
     this.aborted = false;
     this.verifyCode = null;
     this.verifyResolve = null;
@@ -5978,6 +5995,8 @@ class QrLoginModal extends Modal {
 
   async _run() {
     const plugin = this.plugin;
+    // D18: 目标账户槽 —— 取二维码时带上**这个账户**已有的 token, 扫码结果也写回它。
+    const aid = this.accountId || plugin._defaultAccountId();
     let client;
     try {
       client = new ILinkClient();
@@ -5990,7 +6009,7 @@ class QrLoginModal extends Modal {
     let refreshes = 0;
     let verifyCode = null;
     try {
-      const oldToken = plugin.getBotToken();
+      const oldToken = plugin.getBotToken(aid);
       let { qrcode: ticket, qrPageUrl } = await client.getQrcode(oldToken ? [oldToken] : []);
       this._renderQr(qrPageUrl);
       this._setStatus("等待扫码…");
@@ -5999,7 +6018,7 @@ class QrLoginModal extends Modal {
       const refreshQr = async (statusText) => {
         refreshes += 1;
         if (refreshes > 3) return false;
-        const fresh = await client.getQrcode(plugin.getBotToken() ? [plugin.getBotToken()] : []);
+        const fresh = await client.getQrcode(plugin.getBotToken(aid) ? [plugin.getBotToken(aid)] : []);
         ticket = fresh.qrcode;
         verifyCode = null; // 新码不携带旧验证码
         qrIssuedAt = Date.now();
@@ -6034,7 +6053,7 @@ class QrLoginModal extends Modal {
           await plugin.onLoginConfirmed({
             botToken: j.bot_token, botId: j.ilink_bot_id,
             userId: j.ilink_user_id, baseUrl: (j.baseurl || "").trim(),
-          });
+          }, aid);
           new Notice("微信绑定成功 📖");
           this.close();
           return;
@@ -6045,15 +6064,16 @@ class QrLoginModal extends Modal {
           // existing local credentials remain valid. Callers should treat this as a
           // successful outcome". v0.2.1 之前这里在缺 userId 时误报成"已绑定到别处",
           // 把本来能救的半绑定判成了死局。
-          if (plugin.getBotToken()) {
+          if (plugin.getBotToken(aid)) {
             const uid = (r.json && r.json.ilink_user_id) || "";
-            if (uid && !plugin.data.ilink.userId) await plugin.adoptOwner(uid);
-            if (plugin.data.ilink.userId) {
+            const acct = plugin.accountById(aid);
+            if (uid && acct && !acct.ilink.userId) await plugin.adoptOwner(uid, aid);
+            if (acct && acct.ilink.userId) {
               new Notice("这个 bot 已经连过了, 沿用现有登录");
             } else {
               // 服务端这一路不保证下发 ilink_user_id; 拿不到就交给管道认领
               new Notice("这个 bot 已经连过了。给它发条消息, 就能把你认回来");
-              plugin.startPipeline();
+              plugin.startPipeline(aid);
             }
             this.close();
           } else {
@@ -6863,6 +6883,49 @@ function installSettingsShim(settings, data) {
   }
 }
 
+// ── D18 第 3 步: 每账户一条长轮询管道的运行时状态 ─────────────────────────
+
+// 一条管道的全部运行时字段。**每账户一份**, 所以第二个账户的故障计数/冷却/在途 sleep
+// 不会踩到第一个账户。client 各带自己的 ILinkClient(maxSockets:2 的 Agent 是实例级),
+// 两条并发长轮询各有各的连接预算(§6 用例 9)。
+function newPipelineState() {
+  return {
+    client: null, running: false, failCount: 0, noticedDown: false,
+    pollSettledTs: 0, sleepCancels: new Set(), skippedCount: 0,
+  };
+}
+
+// 第 3 步的兼容访问器: 第 1/2 步的代码(以及既有 bindtest 用例)把 _client / _running /
+// _failCount / _noticedDown / _pollSettledTs / _skipBacklog / _skippedCount / _declinedClaims
+// 当实例字段直接读写。真源现在按账户拆开, 这些名字只能留一个**指向首个账户**的转发视图:
+//   - 单账户下与旧行为逐字等价(首个账户就是唯一账户);
+//   - 多账户下它们不再代表第二条管道 —— main.js 内部一律走 pipelines[id],
+//     只有外部旧调用/旧断言还读这些名字。
+// skipBacklog 没有走 pipelines, 它的真源是 account.ilink.skipBacklog(见 _clearSkipBacklog 的说明)。
+function installPipelineShim(plugin) {
+  const pipe = () => plugin._pipeline(plugin._defaultAccountId());
+  for (const k of ["client", "running", "failCount", "noticedDown", "pollSettledTs", "skippedCount"]) {
+    Object.defineProperty(plugin, "_" + k, {
+      configurable: true,
+      enumerable: false,   // 不当数据字段: JSON.stringify / Object.keys 都不该看见它
+      get() { return pipe()[k]; },
+      set(v) { pipe()[k] = v; },
+    });
+  }
+  Object.defineProperty(plugin, "_skipBacklog", {
+    configurable: true,
+    enumerable: false,
+    get() { const a = plugin.firstAccount(); return !!(a && a.ilink.skipBacklog); },
+    set(v) { const a = plugin.firstAccount(); if (a) a.ilink.skipBacklog = !!v; },
+  });
+  // 答过"不是"的陌生人按账户各一份: 第二个账户的陌生人黑名单不该拉黑第一个账户(反之亦然)。
+  Object.defineProperty(plugin, "_declinedClaims", {
+    configurable: true,
+    enumerable: false,
+    get() { return plugin._declinedSet(plugin._defaultAccountId()); },
+  });
+}
+
 class WechatDiaryPlugin extends Plugin {
   async onload() {
     const stored = (await this.loadData()) || {};
@@ -6909,23 +6972,23 @@ class WechatDiaryPlugin extends Plugin {
 
     this.ai = new AiClient(this);
     this.chatHandler = new ChatHandler(this.ai);
-    // D18: 每账户一套服务(必须在 this.ai / this.chatHandler 就绪之后: DiaryAgent 要拿它们)
-    this._rebuildAccountServices();
-
-    this._running = false;
-    this._client = null;
-    this._failCount = 0;
-    this._noticedDown = false;
-    this._sleepCancels = new Set();
     this._unloaded = false;
     this._activeQrModal = null;
     this._claiming = false;
-    this._declinedClaims = new Set();   // 本次会话里答过"不是"的, 不再反复弹
+    this._declinedClaimSets = {};   // 每账户一个 Set: 本次会话里答过"不是"的, 不再反复弹
+    this._statusById = {};          // 每账户最后一次状态文本(状态栏只有一个位置, 见 _setStatus)
+    this._statusLastId = "";
+    // D18 第 3 步: 每账户一套服务 + 一条管道。**必须在恢复分支之后、启动之前建好** ——
+    // 下面所有判断与 onLayoutReady 启动都读 pipelines; 同时装上指向首个账户的兼容访问器。
+    this._rebuildAccountServices();
+
     // 身份是从 secret 恢复来的 = data.json 没了 = 游标(buf)和去重表(recentSeqs)一起没了。
     // 此时服务端对空游标可能回吐一大段积压消息, 而去重表是空的 —— 照写就会把历史
     // 按【今天】的日期重演一遍(write() 用 todayStr(), 消息报文里没有原始时间),
     // 连「撤回」「结束」这类命令都会被重放。所以先把积压静默跳过, 等流量安静下来再落笔。
-    this._skipBacklog = restored || Boolean(this.data.ilink.skipBacklog);
+    // D18 第 3 步: 这个标志不再是实例布尔, 真源是 account.ilink.skipBacklog(上面恢复分支
+    // 已置 true 并落盘, 每个账户各一份)。_skipBacklog 只是首个账户的兼容视图。
+    if (restored) this.data.ilink.skipBacklog = true;
 
     this.settingTab = new WechatDiarySettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
@@ -6948,7 +7011,8 @@ class WechatDiaryPlugin extends Plugin {
 
     // 每 5 分钟持久化一次心跳时间(离线提示与补收判断用)
     this.registerInterval(window.setInterval(() => {
-      if (this._running) this.persist();
+      // 任一账户的管道在跑就落盘一次(不能用单账户的 _running —— 那只代表首个账户)
+      if (Object.keys(this.pipelines || {}).some((id) => this.pipelines[id].running)) this.persist();
     }, 5 * 60 * 1000));
 
     // 语音气泡(D12): 把本插件写的语音附件(…-语音.wav)渲染成微信样式气泡, 点击即播。
@@ -6988,8 +7052,11 @@ class WechatDiaryPlugin extends Plugin {
 
     // 有 token 就起管道 —— 缺 userId 时进"待认领"模式(只推游标不落笔, 见 _handleIncoming),
     // 让用户发一条消息就能把自己认回来, 而不是卡在未绑定界面无路可走。
+    // D18 第 3 步: **逐账户**起 —— 只有第一个账户有 token 时行为与旧版一致, 两个都有时两条并发。
     this.app.workspace.onLayoutReady(() => {
-      if (this.getBotToken()) this.startPipeline();
+      for (const a of (this.data.accounts || [])) {
+        if (this.getBotToken(a.id)) this.startPipeline(a.id);
+      }
     });
   }
 
@@ -7045,7 +7112,8 @@ class WechatDiaryPlugin extends Plugin {
 
   // D18 第 2 步: 每账户一套 writer/clipper/agent。**凡是把 this.data 整个换掉的地方都要重跑它** ——
   // unbind 会把 data 换成 DEFAULT_DATA(), 旧服务对象还指着旧账户(第 1 步已经在垫片上踩过一次同类坑)。
-  // 第 2 步只有账户 #1 在实际跑(消息路由是第 3 步), 所以 writer/clipper/agent 三个旧别名一律还指第一个账户。
+  // 第 3 步起它同时负责"对账"每账户一条管道: 保留还活着的账户的管道状态(加账户不能打断在跑的第一条),
+  // 删掉已经不存在的账户的管道(解绑重置 data 时由调用方先清空)。
   _rebuildAccountServices() {
     this.writers = {}; this.clippers = {}; this.agents = {};
     for (const a of (this.data.accounts || [])) {
@@ -7053,11 +7121,44 @@ class WechatDiaryPlugin extends Plugin {
       this.clippers[a.id] = new WebClipper(this, a);
       this.agents[a.id] = new DiaryAgent(this, a);
     }
-    // 兼容别名: 第 2 步只有账户 #1 在实际跑(消息路由是第 3 步), 旧调用点一律还指它
+    // 兼容别名: 仍指第一个账户(设置页/命令/旧测试走这些名字)。
+    // 消息路由从第 3 步起走 agents[id]/writers[id], 不再依赖别名。
     const f = this.firstAccount();
     this.writer = f ? this.writers[f.id] : null;
     this.clipper = f ? this.clippers[f.id] : null;
     this.agent = f ? this.agents[f.id] : null;
+    this._reconcilePipelines();
+    installPipelineShim(this);
+  }
+
+  // 管道的"默认账户" = 首个账户。内部一律显式传 id; 只有旧调用点/兼容访问器才用它。
+  _defaultAccountId() {
+    const f = this.firstAccount();
+    return (f && f.id) || FIRST_ACCOUNT_ID;
+  }
+
+  // 取(必要时新建)某账户的管道状态。惰性新建是为了让"先有账户、后有管道"的顺序都能工作。
+  _pipeline(id) {
+    const aid = id || this._defaultAccountId();
+    if (!this.pipelines) this.pipelines = {};
+    if (!this.pipelines[aid]) this.pipelines[aid] = newPipelineState();
+    return this.pipelines[aid];
+  }
+
+  // 让 pipelines 的键集合与 accounts 对齐, 但**不动**已在跑的管道对象(加账户不能打断第一条)。
+  _reconcilePipelines() {
+    if (!this.pipelines) this.pipelines = {};
+    const ids = new Set((this.data.accounts || []).map((a) => a.id));
+    for (const id of Object.keys(this.pipelines)) if (!ids.has(id)) delete this.pipelines[id];
+    for (const id of ids) if (!this.pipelines[id]) this.pipelines[id] = newPipelineState();
+  }
+
+  // 每个账户一个"答过不是的陌生人"集合, 惰性建。
+  _declinedSet(id) {
+    const aid = id || this._defaultAccountId();
+    if (!this._declinedClaimSets) this._declinedClaimSets = {};
+    if (!this._declinedClaimSets[aid]) this._declinedClaimSets[aid] = new Set();
+    return this._declinedClaimSets[aid];
   }
 
   getBotToken(id) {
@@ -7130,22 +7231,42 @@ class WechatDiaryPlugin extends Plugin {
   // 三态: bound(可用) / half(有凭据缺主人, 待认领) / none。
   // v0.2.1 之前这里是二值的, 半绑定被错判成"未绑定", 于是解绑按钮被禁用、
   // 残留 token 又顶得重新扫码必回 binded_redirect —— 用户被锁死在里面出不来。
-  bindState() {
-    if (!this.getBotToken()) return "none";
-    return this.data.ilink.userId ? "bound" : "half";
+  // D18 第 3 步: 按账户判。**不传 id = 首个账户**(设置页第 5 步之前仍是单账户视图)。
+  bindState(id) {
+    const aid = id || this._defaultAccountId();
+    if (!this.getBotToken(aid)) return "none";
+    const a = this.accountById(aid);
+    return a && a.ilink.userId ? "bound" : "half";
   }
 
   async persist() { await this.saveData(this.data); }
 
-  _setStatus(text) { this.statusEl.setText("📖 微信日记: " + text); }
+  // 状态栏只有一个位置, 但要显示多个账户。做法:
+  //   - 单账户: 与旧版逐字一致(回归基线依赖它);
+  //   - 多账户: 显示总数 + "最近一次状态变化属于谁"(label 让它可读), 不做轮播(会显得状态在跳)。
+  // 每个账户的完整状态留给设置页(第 5 步的账户列表)。
+  _setStatus(text, id) {
+    const aid = id || this._defaultAccountId();
+    if (!this._statusById) this._statusById = {};
+    this._statusById[aid] = text;
+    this._statusLastId = aid;
+    const list = this.data.accounts || [];
+    if (list.length <= 1) { this.statusEl.setText("📖 微信日记: " + text); return; }
+    const a = this.accountById(aid);
+    this.statusEl.setText("📖 微信日记: " + list.length + " 个账户 · " + ((a && a.label) || aid) + " " + text);
+  }
 
   // ── 绑定生命周期 ──
 
-  async onLoginConfirmed({ botToken, botId, userId, baseUrl }) {
+  // id: 目标账户(不传 = 首个账户, 兼容旧调用)。重扫码写回原账户, "添加账户"传新账户 id。
+  async onLoginConfirmed({ botToken, botId, userId, baseUrl }, id) {
     if (this._unloaded) return; // 弹窗可能活得比插件久, 别在已卸载实例上起管道
-    this.stopPipeline();
-    this.setBotToken(botToken);
-    const il = this.data.ilink;
+    const aid = id || this._defaultAccountId();
+    const acct = this.accountById(aid);
+    if (!acct) return;
+    this.stopPipeline(aid);   // 只停这一条: 重扫账户 A 不该打断账户 B
+    this.setBotToken(botToken, aid);
+    const il = acct.ilink;
     const sameUser = il.userId === userId;
     // ⚠️ seq 不是全局 id, 是每个 bot 会话从 1 重数的计数器(8/13 实测踩坑):
     // 同一微信号换了新 bot 时保留旧 recentSeqs/buf, 会把新 bot 的前 N 条消息
@@ -7160,43 +7281,47 @@ class WechatDiaryPlugin extends Plugin {
       recentSeqs: sameBot ? il.recentSeqs : [],
     });
     if (!sameUser) {
-      this.data.profile = { state: "unknown", name: null };
-      this.data.session = DEFAULT_DATA().session;
+      // 写在该账户上(不能再用 data.profile 垫片 —— 它会落到账户 #1)
+      acct.profile = { state: "unknown", name: null };
+      acct.session = DEFAULT_DATA().session;
     }
     il.skipBacklog = false;                       // 重新登录 = 重新算账, 不带着上一轮的跳过状态
-    this._skipBacklog = false;
-    this.setBindIdentity(userId, botId, baseUrl); // 与 token 同库, 卸载重装后能自己回来
+    this.setBindIdentity(userId, botId, baseUrl, aid); // 与 token 同库, 卸载重装后能自己回来
     await this.persist();
-    this.startPipeline();
+    this.startPipeline(aid);
     this._refreshSettingsUi(); // 绑定成功后设置页立即显示"已绑定", 不能还挂着扫码按钮
   }
 
   // 待认领状态下有人发来消息: 弹一次确认。同一个 from 不重复弹, 弹窗开着时也不叠。
-  _askClaimOwner(from) {
+  // D18: 陌生人黑名单按账户各一份(_declinedSet), 认领也写回该账户。
+  _askClaimOwner(from, id) {
+    const aid = id || this._defaultAccountId();
     if (this._unloaded || this._claiming) return;
-    if (this._declinedClaims && this._declinedClaims.has(from)) return;
+    const declined = this._declinedSet(aid);
+    if (declined.has(from)) return;
     this._claiming = true;
     // explicit: 点了"不是"才拉黑; 叉掉/Esc 只放开锁, 下条消息还会再问
     new ClaimOwnerModal(this.app, from, async (ok, explicit) => {
       this._claiming = false;
-      if (ok) await this.adoptOwner(from);
-      else if (explicit && this._declinedClaims) this._declinedClaims.add(from);
+      if (ok) await this.adoptOwner(from, aid);
+      else if (explicit) declined.add(from);
     }).open();
   }
 
   // 认回主人: 只补身份, 不动日记、不动 settings。
-  async adoptOwner(userId) {
-    if (this._unloaded || !userId || this.data.ilink.userId) return;
-    const il = this.data.ilink;
+  async adoptOwner(userId, id) {
+    const aid = id || this._defaultAccountId();
+    const acct = this.accountById(aid);
+    if (this._unloaded || !userId || !acct || acct.ilink.userId) return;
+    const il = acct.ilink;
     il.userId = userId;
     il.loginTime = il.loginTime || new Date().toISOString();
     // 走到认领 = buf 游标必然是空的(不然身份不会丢), 服务端可能还在回吐积压。
     // 认领后同样先只推游标, 等一次空轮询再落笔 —— 提示文案"再发一条就开始记"说的就是这个。
     il.skipBacklog = true;
-    this._skipBacklog = true;
-    this.setBindIdentity(userId, il.botId, il.baseUrl);
+    this.setBindIdentity(userId, il.botId, il.baseUrl, aid);
     await this.persist();
-    this._setStatus("已连接");
+    this._setStatus("已连接", aid);
     this._refreshSettingsUi();
     new Notice("认回来了 📖 再发一条就开始记");
   }
@@ -7211,7 +7336,8 @@ class WechatDiaryPlugin extends Plugin {
   // keepToken: 只清主人身份, 留着凭据回到"待认领"(认错人时的复位入口)。
   // 默认 false = 连凭据一起清, 这一步可能不可逆, 调用方必须先确认过。
   async unbind(keepToken) {
-    this.stopPipeline();
+    this.stopPipeline();      // 不传 id = 全部停
+    this.pipelines = {};      // data 要整个换掉, 旧管道状态(含已停的)一并丢弃
     const token = keepToken ? this.getBotToken() : "";
     const keep = this.data.settings;
     this.data = DEFAULT_DATA();
@@ -7224,7 +7350,8 @@ class WechatDiaryPlugin extends Plugin {
     // 先写会被 DEFAULT_DATA() 抹掉 —— keepToken 会变成静默失效。
     this.setBotToken(token);
     this.setBindIdentity("");   // 身份副本一起清, 否则下次 onload 又给"恢复"回来
-    this._declinedClaims = new Set();  // 复位后重新开放认领
+    this._declinedClaimSets = {};  // 复位后重新开放认领(每账户一份)
+    this._statusById = {};
     await this.persist();
     if (token) { this.startPipeline(); return; }   // 待认领: 管道继续跑, 等人发消息
     this._setStatus("未绑定");
@@ -7232,45 +7359,57 @@ class WechatDiaryPlugin extends Plugin {
 
   // ── 消息管道 ──
 
-  startPipeline() {
-    if (this._running) return;
-    this._pollSettledTs = 0; // 新管道必须先完成一轮拉取, 提醒才可信(重扫码换管道时旧值不能沿用)
+  // D18 第 3 步: 每账户一条。id 不传 = 首个账户(旧调用点与单账户行为不变)。
+  startPipeline(id) {
+    const aid = id || this._defaultAccountId();
+    const acct = this.accountById(aid);
+    if (!acct) return;
+    const pipe = this._pipeline(aid);
+    if (pipe.running) return;
+    pipe.pollSettledTs = 0; // 新管道必须先完成一轮拉取, 提醒才可信(重扫码换管道时旧值不能沿用)
     try {
-      this._client = new ILinkClient();
+      pipe.client = new ILinkClient();
     } catch (e) {
-      this._setStatus("仅桌面端可用");
+      this._setStatus("仅桌面端可用", aid);
       return;
     }
-    this._client.token = this.getBotToken();
-    this._client.baseUrl = this.data.ilink.baseUrl;
-    this._running = true;
-    this._failCount = 0;
-    this._noticedDown = false;
-    this.agent.offlineNotice = this._computeOfflineNotice();
-    if (!this._isPaused()) this._client.notify("notifystart");
-    this._setStatus(this.bindState() === "half" ? "待认领, 给 bot 发条消息" : "已连接");
-    this._loop().catch((e) => {
-      console.error("[wechat-diary] 管道异常退出:", e);
-      this._running = false;
-      this._setStatus("管道异常, 重启插件恢复");
+    pipe.client.token = this.getBotToken(aid);
+    pipe.client.baseUrl = acct.ilink.baseUrl;
+    pipe.running = true;
+    pipe.failCount = 0;
+    pipe.noticedDown = false;
+    const agent = this.agents[aid];
+    if (agent) agent.offlineNotice = this._computeOfflineNotice(aid);
+    if (!this._isPaused(aid)) pipe.client.notify("notifystart");
+    this._setStatus(this.bindState(aid) === "half" ? "待认领, 给 bot 发条消息" : "已连接", aid);
+    this._loop(aid).catch((e) => {
+      console.error("[wechat-diary] 管道异常退出(" + aid + "):", e);
+      pipe.running = false;
+      this._setStatus("管道异常, 重启插件恢复", aid);
     });
   }
 
   // 解除"只推游标不落笔"。两个入口都要调: 空批次, 和长轮询超时。
   // 落盘: 追平之前用户关掉 Obsidian 的话, 下次启动 userId 已在 data.json 里(不再走恢复分支),
   // 光靠内存标志会失效, 那一整段积压就会在下次启动时被当成新消息写进今天。
-  async _clearSkipBacklog() {
-    if (!this._skipBacklog) return;
-    this._skipBacklog = false;
-    this.data.ilink.skipBacklog = false;
-    const n = this._skippedCount || 0;
-    this._skippedCount = 0;
+  // D18 第 3 步: 真源是 **account.ilink.skipBacklog**(每账户), 不再是实例布尔 —— 恢复分支
+  // 与认领都写这个字段并落盘, 所以跨重启也成立。跳过计数是内存诊断值, 放 pipeline 里。
+  async _clearSkipBacklog(id) {
+    const aid = id || this._defaultAccountId();
+    const acct = this.accountById(aid);
+    if (!acct || !acct.ilink.skipBacklog) return;
+    acct.ilink.skipBacklog = false;
+    const pipe = this._pipeline(aid);
+    const n = pipe.skippedCount || 0;
+    pipe.skippedCount = 0;
     await this.persist();
     if (n) new Notice("微信日记: 已跳过离线期间的 " + n + " 条历史消息, 现在开始正常记录");
   }
 
-  _isPaused() {
-    const p = this.data.ilink.pauseUntil;
+  // D18: 冷却按账户 —— 账户 A 的 -14 不该暂停账户 B。
+  _isPaused(id) {
+    const acct = this.accountById(id || this._defaultAccountId());
+    const p = acct && acct.ilink.pauseUntil;
     return Boolean(p && Date.now() < p);
   }
 
@@ -7351,24 +7490,48 @@ class WechatDiaryPlugin extends Plugin {
     b.setAttribute("aria-label", playing ? "暂停语音" : (b.dataset.wdBaseLabel || "播放语音"));
   }
 
-  // 每日提醒(D10)。发送前提: 管道活着且最近一轮拉取已完成(_pollSettledTs 新鲜)——
+  // 每日提醒(D10)。D18 第 3/4 步: **逐账户各推各的** ——
+  // 每个账户用它自己的管道状态、自己的提醒开关/时间、自己在自己日记树里数的段数、
+  // 自己的 client/userId/contextToken, 记账落在自己的 session 上。
+  // 发送前提(逐账户): 管道活着且最近一轮拉取已完成(_pollSettledTs 新鲜)——
   // 电脑刚唤醒时今天的消息可能还没补收进来, 这时 countDay()=0 是假象, 不能催人。
   // 一天只试一次(先记账再发, 网络错也不重试, 防"发成功但响应丢了"的双发); 结果记在
   // session.reminder_last_result 里攒数据——提醒到底发不发得出去, 019 时代没人知道, 现在按返回码见分晓。
   async _reminderTick() {
-    if (!this._running || !this._client || this._skipBacklog || this._isPaused()) return;
-    const il = this.data.ilink;
+    // 某账户抛错不能连累其余账户: 逐账户 try/catch(跨天文件被占用之类是单账户事件)
+    for (const acct of (this.data.accounts || [])) {
+      try { await this._reminderTickOne(acct.id); }
+      catch (e) { console.error("[wechat-diary] 提醒检查失败(" + acct.id + "):", e && e.message); }
+    }
+  }
+
+  // 账户版设置解析: 与 DiaryWriter._st / DiaryAgent._st 逐字同义(账户设了用账户, undefined 回落全局)。
+  // 注意 `=== undefined` 判断: reminderEnabled=false 是"账户明确关掉", 不能回落全局的 true。
+  _st(key, id) {
+    const acct = this.accountById(id || this._defaultAccountId());
+    const v = acct && acct.diary ? acct.diary[key] : undefined;
+    return v === undefined ? this.settings[key] : v;
+  }
+
+  async _reminderTickOne(id) {
+    const acct = this.accountById(id);
+    if (!acct) return;
+    const pipe = this._pipeline(id);
+    const il = acct.ilink;
+    if (!pipe.running || !pipe.client || il.skipBacklog || this._isPaused(id)) return;
     if (!il.userId) return;
-    if (!this._pollSettledTs || Date.now() - this._pollSettledTs > 3 * 60 * 1000) return;
-    const s = this.data.session;
+    if (!pipe.pollSettledTs || Date.now() - pipe.pollSettledTs > 3 * 60 * 1000) return;
+    const s = acct.session;
     const now = new Date();
     const ctx = {
-      enabled: this.settings.reminderEnabled, timeStr: this.settings.reminderTime || "21:30",
+      enabled: this._st("reminderEnabled", id), timeStr: this._st("reminderTime", id) || "21:30",
       now, countToday: 0, remindedDate: s.reminded_date, streak: s.reminder_streak,
     };
     // 先用 countToday=0 预判: 其余条件不满足就不必读文件(每分钟 tick, 关着提醒也读一遍太浪费)
     if (!reminderDue(ctx)) return;
-    ctx.countToday = await this.writer.countDay();
+    // **在该账户自己的日记树里数段** —— 这是"各推各的"的核心
+    const writer = this.writers[id];
+    ctx.countToday = writer ? await writer.countDay() : 0;
     if (!reminderDue(ctx)) return;
     s.reminded_date = logicalTodayStr(now);
     const text = reminderText(s.reminder_idx || 0);
@@ -7376,33 +7539,45 @@ class WechatDiaryPlugin extends Plugin {
     await this.persist();
     const genBefore = this._writeGen || 0; // 发送在途时的新写入不该被 streak++ 覆盖
     try {
-      await this._client.sendText(il.userId, text, il.contextTokens[il.userId]);
+      await pipe.client.sendText(il.userId, text, il.contextTokens[il.userId]);
       if ((this._writeGen || 0) === genBefore) s.reminder_streak = (s.reminder_streak || 0) + 1;
       s.reminder_last_result = "ok " + new Date().toISOString();
     } catch (e) {
       s.reminder_last_result = "fail " + ((e && (e.ilinkCode || e.message)) || "?") + " " + new Date().toISOString();
+      // -14 冷却只暂停这个账户
       if (e && e.ilinkCode === STALE_TOKEN_ERRCODE) il.pauseUntil = Date.now() + SESSION_PAUSE_MS;
-      console.error("[wechat-diary] 提醒发送失败:", e && e.message);
+      console.error("[wechat-diary] 提醒发送失败(" + id + "):", e && e.message);
     }
     await this.persist();
   }
 
-  stopPipeline() {
-    if (!this._running && !this._client) return;
-    this._running = false;
-    if (this._client) {
-      this._client.notify("notifystop");
-      const c = this._client;
+  // id 不传 = 全部停(onunload / unbind 用)。传 id = 只停那一条: 重扫账户 A 不该打断 B。
+  stopPipeline(id) {
+    const ids = id ? [id] : Object.keys(this.pipelines || {});
+    for (const aid of ids) this._stopPipelineOne(aid);
+  }
+
+  _stopPipelineOne(id) {
+    const pipe = this.pipelines ? this.pipelines[id] : null;
+    if (!pipe) return;
+    if (!pipe.running && !pipe.client) return;
+    pipe.running = false;
+    if (pipe.client) {
+      pipe.client.notify("notifystop");
+      const c = pipe.client;
       window.setTimeout(() => c.destroyAll(), 500); // 给 notifystop 半秒钟发出去
-      this._client = null;
+      pipe.client = null;
     }
-    for (const cancel of [...this._sleepCancels]) cancel();
-    this.data.ilink.lastAliveTs = Date.now();
+    // 只取消本账户在途的 sleep —— 停一个账户不该把另一个账户的退避也唤醒
+    for (const cancel of [...pipe.sleepCancels]) cancel();
+    const acct = this.accountById(id);
+    if (acct) acct.ilink.lastAliveTs = Date.now();
     this.persist();
   }
 
-  _computeOfflineNotice() {
-    const ts = this.data.ilink.lastAliveTs;
+  _computeOfflineNotice(id) {
+    const acct = this.accountById(id || this._defaultAccountId());
+    const ts = acct && acct.ilink.lastAliveTs;
     if (!ts) return null;
     const gapH = (Date.now() - ts) / 3600000;
     if (gapH < OFFLINE_NOTICE_GAP_H) return null;
@@ -7410,28 +7585,32 @@ class WechatDiaryPlugin extends Plugin {
       "翻一下聊天记录, 漏了的可以再发我一次)";
   }
 
-  _interruptibleSleep(ms) {
+  _interruptibleSleep(ms, id) {
     // Set 而非单字段: 理论上只有一个 loop 在睡, 但生命周期切换的瞬间可能有两个
+    const pipe = this._pipeline(id);
     return new Promise((resolve) => {
-      const cancel = () => { window.clearTimeout(t); this._sleepCancels.delete(cancel); resolve(); };
-      const t = window.setTimeout(() => { this._sleepCancels.delete(cancel); resolve(); }, ms);
-      this._sleepCancels.add(cancel);
+      const cancel = () => { window.clearTimeout(t); pipe.sleepCancels.delete(cancel); resolve(); };
+      const t = window.setTimeout(() => { pipe.sleepCancels.delete(cancel); resolve(); }, ms);
+      pipe.sleepCancels.add(cancel);
     });
   }
-
-  async _loop() {
+  // D18 第 3 步: 每账户一条。id 由 startPipeline 显式传入(不再有隐式单例)。
+  async _loop(id) {
+    const acct = this.accountById(id);
+    const pipe = this._pipeline(id);
+    if (!acct) return;
     // 代数守卫: 重新扫码会换 client 实例; 任何 await 回来后发现 client 换了就自杀,
-    // 否则旧 loop 会和新 loop 并发轮询同一个 buf(双循环 bug)
-    const client = this._client;
-    const dead = () => !this._running || this._client !== client;
+    // 否则旧 loop 会和新 loop 并发轮询同一个 buf(双循环 bug)。账户被删(data 重置)同理。
+    const client = pipe.client;
+    const dead = () => !pipe.running || pipe.client !== client || !this.accountById(id);
+    const il = acct.ilink;
     let pollTimeout = LONG_POLL_TIMEOUT_MS;
     while (!dead()) {
-      const il = this.data.ilink;
-      // -14 冷却: 不清 token 不重登, 用同一 token 同一 buf 等冷却结束继续
-      if (this._isPaused()) {
+      // -14 冷却: 不清 token 不重登, 用同一 token 同一 buf 等冷却结束继续(每账户各自一份 pauseUntil)
+      if (this._isPaused(id)) {
         const left = il.pauseUntil - Date.now();
-        this._setStatus("冷却中, " + Math.ceil(left / 60000) + " 分钟后恢复");
-        await this._interruptibleSleep(Math.min(left, 60000));
+        this._setStatus("冷却中, " + Math.ceil(left / 60000) + " 分钟后恢复", id);
+        await this._interruptibleSleep(Math.min(left, 60000), id);
         continue;
       }
 
@@ -7440,21 +7619,21 @@ class WechatDiaryPlugin extends Plugin {
         r = await client.getUpdates(il.buf, pollTimeout);
       } catch (e) {
         if (dead()) break;
-        this._failCount += 1;
-        if (this._failCount >= 5 && !this._noticedDown) {
-          this._noticedDown = true;
-          this._setStatus("连不上微信服务, 重试中");
+        pipe.failCount += 1;
+        if (pipe.failCount >= 5 && !pipe.noticedDown) {
+          pipe.noticedDown = true;
+          this._setStatus("连不上微信服务, 重试中", id);
         }
-        if (this._failCount >= 3) { this._failCount = 0; await this._interruptibleSleep(30000); }
-        else await this._interruptibleSleep(2000);
+        if (pipe.failCount >= 3) { pipe.failCount = 0; await this._interruptibleSleep(30000, id); }
+        else await this._interruptibleSleep(2000, id);
         continue;
       }
       if (dead()) break;
       // 长轮询正常心跳 = 服务端没东西给了 = 积压追平。必须在这里也解除跳过:
       // 服务端到底会不会返回一个 msgs 为空的响应是未知的(协议笔记 P0 第 1 条),
-      // 只认"空 msgs"的话, 一旦它选择 hold 到超时, _skipBacklog 就永远解不掉,
+      // 只认"空 msgs"的话, 一旦它选择 hold 到超时, skipBacklog 就永远解不掉,
       // 插件会安静地再也不写日记 —— 比重复写还糟。
-      if (r.__timeout) { this._pollSettledTs = Date.now(); await this._clearSkipBacklog(); continue; }
+      if (r.__timeout) { pipe.pollSettledTs = Date.now(); await this._clearSkipBacklog(id); continue; }
 
       const code = respCode(r.json);
       if (code === STALE_TOKEN_ERRCODE) {
@@ -7463,16 +7642,16 @@ class WechatDiaryPlugin extends Plugin {
         continue;
       }
       if (code !== 0) {
-        this._failCount += 1;
-        if (this._failCount >= 3) { this._failCount = 0; await this._interruptibleSleep(30000); }
-        else await this._interruptibleSleep(2000);
+        pipe.failCount += 1;
+        if (pipe.failCount >= 3) { pipe.failCount = 0; await this._interruptibleSleep(30000, id); }
+        else await this._interruptibleSleep(2000, id);
         continue;
       }
 
-      this._failCount = 0;
-      if (this._noticedDown) { this._noticedDown = false; this._setStatus("已连接"); }
+      pipe.failCount = 0;
+      if (pipe.noticedDown) { pipe.noticedDown = false; this._setStatus("已连接", id); }
       il.lastAliveTs = Date.now();
-      this._pollSettledTs = Date.now(); // 一轮拉取完成: 今天的积压已进来, 提醒的 countDay 才可信
+      pipe.pollSettledTs = Date.now(); // 一轮拉取完成: 今天的积压已进来, 提醒的 countDay 才可信
 
       if (typeof r.json.longpolling_timeout_ms === "number" && r.json.longpolling_timeout_ms > 0) {
         pollTimeout = r.json.longpolling_timeout_ms;
@@ -7482,13 +7661,13 @@ class WechatDiaryPlugin extends Plugin {
       // 中途退出/崩溃就重放这一批(recentSeqs 去重兜底), 用户的话不静默丢
       const msgs = Array.isArray(r.json.msgs) ? r.json.msgs : [];
 
-      if (msgs.length === 0) await this._clearSkipBacklog(); // 空批次同样说明追平了
+      if (msgs.length === 0) await this._clearSkipBacklog(id); // 空批次同样说明追平了
 
       let batchDone = true;
       for (const msg of msgs) {
         if (dead()) { batchDone = false; break; }
-        try { await this._handleIncoming(msg); }
-        catch (e) { console.error("[wechat-diary] 处理消息失败:", e); }
+        try { await this._handleIncoming(msg, id); }
+        catch (e) { console.error("[wechat-diary] 处理消息失败(" + id + "):", e); }
       }
       if (batchDone && !dead() && r.json.get_updates_buf) {
         il.buf = r.json.get_updates_buf;
@@ -7497,11 +7676,16 @@ class WechatDiaryPlugin extends Plugin {
     }
   }
 
-  async _handleIncoming(msg) {
+  // D18 第 3 步最关键的一处: 一条消息"是不是我的主人"必须拿**该管道对应账户**的
+  // ilink.userId 来比。改错这里, 第二个账户会完全收不到消息(或者更糟: 收到别人的消息)。
+  async _handleIncoming(msg, id) {
     if (!msg || typeof msg !== "object") return;
     if (msg.message_type === 2) return; // BOT 自己的消息
     if (msg.message_state === 1) return; // GENERATING 半成品
-    const il = this.data.ilink;
+    const aid = id || this._defaultAccountId();
+    const acct = this.accountById(aid);
+    if (!acct) return;
+    const il = acct.ilink;
 
     const from = msg.from_user_id || "";
     if (!from) return;
@@ -7509,13 +7693,14 @@ class WechatDiaryPlugin extends Plugin {
     // 待认领: 有 token 但 userId 丢了。这里一个字都不写 —— 游标照常推进(_loop),
     // 服务端积压的旧消息因此被干净跳过, 不会在日记里重复成一片。认领要用户在
     // Obsidian 里点确认: 协议层没有 allowlist, 不弹窗就等于谁先发消息谁当主人。
-    if (!il.userId) { this._askClaimOwner(from); return; }
+    if (!il.userId) { this._askClaimOwner(from, aid); return; }
 
-    // 恢复身份后的第一波: 只推游标不落笔(见 onload 处 _skipBacklog 的说明)
-    if (this._skipBacklog) { this._skippedCount = (this._skippedCount || 0) + 1; return; }
+    // 恢复身份后的第一波: 只推游标不落笔(见 onload 处 skipBacklog 的说明)
+    if (il.skipBacklog) { const pipe = this._pipeline(aid); pipe.skippedCount = (pipe.skippedCount || 0) + 1; return; }
 
     // 白名单: 协议层没有 allowlist, 陌生人可直达 bot。
-    // 不回复(等于确认 bot 存活)、不存 token(data.json 会被陌生人无限撑大), 静默丢弃
+    // 不回复(等于确认 bot 存活)、不存 token(data.json 会被陌生人无限撑大), 静默丢弃。
+    // D18: 基准是**本账户**的 userId —— 用全局垫片的话第二个账户的消息会被当陌生人丢掉。
     if (from !== il.userId) return;
 
     const seqKey = msg.seq != null ? "s" + msg.seq : (msg.message_id != null ? "m" + msg.message_id : "");
@@ -7552,13 +7737,17 @@ class WechatDiaryPlugin extends Plugin {
     if (!hasText && !hasVoice && !images.length && !files.length && !videos.length) return; // 未知类型仍忽略
     const isVoice = hasVoice && !hasText;
 
-    const reply = await this.agent.onMessage(from, text, isVoice, images, { voices, files, videos, voiceAudio });
+    // 处理链路全走该账户的 agent(它内部持有本账户的 writer/clipper/profile/session)
+    const agent = this.agents[aid];
+    if (!agent) return;
+    const reply = await agent.onMessage(from, text, isVoice, images, { voices, files, videos, voiceAudio });
     if (reply && from) {
+      const pipe = this._pipeline(aid);
       // 冷却期不出站(官方 assertSessionActive 语义): 日记已写入, 只是确认回执发不出
-      if (this._isPaused() || !this._client) return;
+      if (this._isPaused(aid) || !pipe.client) return;
       try {
-        await this._client.sendText(from, reply, il.contextTokens[from]);
-        if (this.agent.commitNudge()) await this.persist();
+        await pipe.client.sendText(from, reply, il.contextTokens[from]);
+        if (agent.commitNudge()) await this.persist();
       } catch (e) {
         if (e && e.ilinkCode === STALE_TOKEN_ERRCODE) {
           il.pauseUntil = Date.now() + SESSION_PAUSE_MS;

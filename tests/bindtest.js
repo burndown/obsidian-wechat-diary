@@ -1726,6 +1726,167 @@ async function newPlugin(secrets, storedData) {
     check("D18-2 落盘仍有 settings 里那份(回退 0.4.0 时设置不丢)", p8disk.settings.diaryFolder === "改过的" && p8disk.settings.sharedDailyNote === true, JSON.stringify(p8disk.settings));
   }
 
+  console.log("\n【D18-3】管道按账户 + 提醒按账户(多账户第 3+4 步)");
+  {
+    // 造一个"两个账户都绑好了"的插件: a1 = U1(日记甲), a2 = U2(日记乙)。
+    // a2 走与第 5 步"添加账户"同一条路: push 账户 + _rebuildAccountServices(顺带对账 pipelines)。
+    const mkTwo = async (diaryA, diaryB) => {
+      const secrets = {
+        [SECRET_TOKEN]: "TOK-A",
+        "wechat-diary-ilink-bot-token:a2": "TOK-B",
+      };
+      const p = await newPlugin(secrets, BOUND_DATA());
+      p.data.accounts[0].ilink.userId = "U1";
+      p.data.accounts[0].ilink.baseUrl = "https://a.example";
+      Object.assign(p.data.accounts[0].diary, diaryA || {});
+      const a2 = I.newAccount("a2", "账户 2", diaryB || {});
+      a2.ilink.userId = "U2"; a2.ilink.botId = "B2"; a2.ilink.baseUrl = "https://b.example";
+      p.data.accounts.push(a2);
+      p._rebuildAccountServices();
+      return p;
+    };
+    const msgFrom = (from, text, seq, ctx) => ({
+      from_user_id: from, seq: String(seq),
+      ...(ctx ? { context_token: ctx } : {}),
+      item_list: [{ type: 1, text_item: { text } }],
+    });
+    // 备好一条"能写进去的日记话"(别踩到 HELP/CHAT/撤回 等命令意图)
+    const DIARY_TEXT_A = "甲今天试了新的手冲豆子, 花香很明显";
+    const DIARY_TEXT_B = "乙今天去公园跑了五公里, 腿有点酸";
+    const today = I.logicalTodayStr();
+
+    console.log("  — D18-3.1 陌生人判定按账户: a1 的管道收到 a2 的主人 → 静默丢弃");
+    const p1 = await mkTwo({ diaryFolder: "甲", pathFormat: "YYYY-MM-DD" }, { diaryFolder: "乙", pathFormat: "YYYY-MM-DD" });
+    const gv1 = fakeVault2();
+    p1.app.vault = gv1;
+    const sent1 = [];
+    p1.pipelines.a1.client = { sendText: async (to, t) => sent1.push(["a1", to, t]) };
+    p1.pipelines.a2.client = { sendText: async (to, t) => sent1.push(["a2", to, t]) };
+    await p1._handleIncoming(msgFrom("U2", DIARY_TEXT_B, 1), "a1");
+    check("D18-3 a2 的 userId 进 a1 管道 → 不写、不回复", Object.keys(gv1.files).length === 0 && sent1.length === 0,
+      JSON.stringify([Object.keys(gv1.files), sent1]));
+    await p1._handleIncoming(msgFrom("U1", DIARY_TEXT_A, 2, "CTX-A"), "a1");
+    const files1 = Object.keys(gv1.files);
+    check("D18-3 a1 收到自己的 → 正常写入并回复", files1.some((k) => k.startsWith("甲/")) && sent1.length === 1 && sent1[0][0] === "a1",
+      JSON.stringify([files1, sent1]));
+
+    console.log("  — D18-3.2 各写各的树: a2 的消息只进 a2 的文件夹");
+    await p1._handleIncoming(msgFrom("U2", DIARY_TEXT_B, 3, "CTX-B"), "a2");
+    const files2 = Object.keys(gv1.files);
+    check("D18-3 a2 的消息写进 a2 的文件夹", files2.some((k) => k.startsWith("乙/")), JSON.stringify(files2));
+    check("D18-3 a1 的树里没有 a2 的那条", files2.filter((k) => k.startsWith("甲/")).every((k) => !gv1.files[k].includes(DIARY_TEXT_B)),
+      JSON.stringify(files2.filter((k) => k.startsWith("甲/"))));
+    check("D18-3 a2 走的是自己的 agent/writer(不是 a1 的)", p1.agents.a2.writer === p1.writers.a2 && p1.agents.a2.writer !== p1.writers.a1);
+    check("D18-3 context_token 也按账户存", p1.data.accounts[0].ilink.contextTokens.U1 === "CTX-A" && p1.data.accounts[1].ilink.contextTokens.U2 === "CTX-B",
+      JSON.stringify([p1.data.accounts[0].ilink.contextTokens, p1.data.accounts[1].ilink.contextTokens]));
+
+    console.log("  — D18-3.3 独立启停: 停 a1 不动 a2");
+    const p3 = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" });
+    const c3a = { destroyed: false, destroyAll() { this.destroyed = true; }, notify() {} };
+    const c3b = { destroyed: false, destroyAll() { this.destroyed = true; }, notify() {} };
+    p3.pipelines.a1.client = c3a; p3.pipelines.a1.running = true;
+    p3.pipelines.a2.client = c3b; p3.pipelines.a2.running = true;
+    p3.stopPipeline("a1");
+    check("D18-3 stopPipeline('a1') 只停 a1", p3.pipelines.a1.running === false && p3.pipelines.a1.client === null);
+    check("D18-3 a2 仍在跑、client 还是原来那个", p3.pipelines.a2.running === true && p3.pipelines.a2.client === c3b);
+    await new Promise((r) => setTimeout(r, 600)); // 等过 notifystop 的 500ms 宽限
+    check("D18-3 a2 的 client 没被 destroy", c3b.destroyed === false && c3a.destroyed === true,
+      JSON.stringify([c3a.destroyed, c3b.destroyed]));
+    p3.stopPipeline(); // 不传 = 全部停
+    check("D18-3 stopPipeline() 停全部", p3.pipelines.a1.running === false && p3.pipelines.a2.running === false);
+
+    console.log("  — D18-3.4 -14 冷却独立: a1 遇 STALE_TOKEN 只暂停 a1");
+    const p4 = await mkTwo(
+      { diaryFolder: "甲", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() },
+      { diaryFolder: "乙", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() });
+    p4.app.vault = fakeVault2();
+    const sent4 = [];
+    p4.pipelines.a1.running = true; p4.pipelines.a1.pollSettledTs = Date.now();
+    p4.pipelines.a1.client = { sendText: async () => { const e = new Error("发送失败 ret=-14"); e.ilinkCode = -14; throw e; } };
+    p4.pipelines.a2.running = true; p4.pipelines.a2.pollSettledTs = Date.now();
+    p4.pipelines.a2.client = { sendText: async (to, t) => sent4.push([to, t]) };
+    await p4._reminderTick();
+    check("D18-3 a1 的 -14 只让 a1 进冷却", p4._isPaused("a1") === true, String(p4.data.accounts[0].ilink.pauseUntil));
+    check("D18-3 a2 的 pauseUntil 一点没动", !p4.data.accounts[1].ilink.pauseUntil, String(p4.data.accounts[1].ilink.pauseUntil));
+    check("D18-3 a2 的提醒照常发出且发给 U2", sent4.length === 1 && sent4[0][0] === "U2", JSON.stringify(sent4));
+    check("D18-3 a1 的失败记在自己账上", String(p4.data.accounts[0].session.reminder_last_result).startsWith("fail"));
+
+    console.log("  — D18-3.5 提醒各推各的: A 记了 B 没记 → 只提醒 B");
+    const p5 = await mkTwo(
+      { diaryFolder: "甲", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() },
+      { diaryFolder: "乙", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() });
+    p5.app.vault = fakeVault2();
+    const sent5 = [];
+    p5.pipelines.a1.running = true; p5.pipelines.a1.pollSettledTs = Date.now();
+    p5.pipelines.a1.client = { sendText: async (to, t) => sent5.push(["a1", to, t]) };
+    p5.pipelines.a2.running = true; p5.pipelines.a2.pollSettledTs = Date.now();
+    p5.pipelines.a2.client = { sendText: async (to, t) => sent5.push(["a2", to, t]) };
+    await p5.writers.a1.write(DIARY_TEXT_A, false, today);   // 只有 A 记了
+    await p5._reminderTick();
+    check("D18-3 A 记了 → 只提醒 B", sent5.length === 1 && sent5[0][0] === "a2" && sent5[0][1] === "U2", JSON.stringify(sent5));
+    check("D18-3 B 的记账落在 B 的 session, A 的没动", (p5.data.accounts[1].session.reminded_date === today) && !p5.data.accounts[0].session.reminded_date,
+      JSON.stringify([p5.data.accounts[0].session.reminded_date, p5.data.accounts[1].session.reminded_date]));
+    check("D18-3 还没记的 A 的 streak 保持 0", p5.data.accounts[0].session.reminder_streak === 0);
+
+    console.log("  — D18-3.6 提醒数的是自己那棵树(反向: 只有 B 记了 → 只提醒 A)");
+    const p6 = await mkTwo(
+      { diaryFolder: "甲", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() },
+      { diaryFolder: "乙", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() });
+    p6.app.vault = fakeVault2();
+    const sent6 = [];
+    p6.pipelines.a1.running = true; p6.pipelines.a1.pollSettledTs = Date.now();
+    p6.pipelines.a1.client = { sendText: async (to, t) => sent6.push(["a1", to, t]) };
+    p6.pipelines.a2.running = true; p6.pipelines.a2.pollSettledTs = Date.now();
+    p6.pipelines.a2.client = { sendText: async (to, t) => sent6.push(["a2", to, t]) };
+    await p6.writers.a2.write(DIARY_TEXT_B, false, today);   // 只有 B 记了
+    await p6._reminderTick();
+    check("D18-3 只有 B 记了 → 只提醒 A", sent6.length === 1 && sent6[0][0] === "a1" && sent6[0][1] === "U1", JSON.stringify(sent6));
+
+    console.log("  — D18-3.7 两个都空 → 各发各的; A 关了提醒 → 即使空也不提醒 A");
+    const p7 = await mkTwo(
+      { diaryFolder: "甲", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() },
+      { diaryFolder: "乙", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() });
+    p7.app.vault = fakeVault2();
+    const sent7 = [];
+    p7.pipelines.a1.running = true; p7.pipelines.a1.pollSettledTs = Date.now();
+    p7.pipelines.a1.client = { sendText: async (to, t) => sent7.push(["a1", to, t]) };
+    p7.pipelines.a2.running = true; p7.pipelines.a2.pollSettledTs = Date.now();
+    p7.pipelines.a2.client = { sendText: async (to, t) => sent7.push(["a2", to, t]) };
+    await p7._reminderTick();
+    check("D18-3 都空 → 两条提醒, 分别给 U1/U2", sent7.length === 2 && sent7.some((x) => x[1] === "U1") && sent7.some((x) => x[1] === "U2"),
+      JSON.stringify(sent7));
+    const p7b = await mkTwo(
+      { diaryFolder: "甲", pathFormat: "YYYY-MM-DD", reminderEnabled: false, reminderTime: I.hhmmStr() },
+      { diaryFolder: "乙", pathFormat: "YYYY-MM-DD", reminderEnabled: true, reminderTime: I.hhmmStr() });
+    p7b.app.vault = fakeVault2();
+    const sent7b = [];
+    p7b.pipelines.a1.running = true; p7b.pipelines.a1.pollSettledTs = Date.now();
+    p7b.pipelines.a1.client = { sendText: async (to, t) => sent7b.push(["a1", to, t]) };
+    p7b.pipelines.a2.running = true; p7b.pipelines.a2.pollSettledTs = Date.now();
+    p7b.pipelines.a2.client = { sendText: async (to, t) => sent7b.push(["a2", to, t]) };
+    await p7b._reminderTick();
+    check("D18-3 A 关了提醒 → 即使空也只提醒 B(账户的 false 压过全局)", sent7b.length === 1 && sent7b[0][0] === "a2",
+      JSON.stringify(sent7b));
+
+    console.log("  — D18-3.8 凭据隔离: 各自的 client.token / baseUrl / userId 不串");
+    const p8 = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" });
+    p8.startPipeline = Object.getPrototypeOf(p8).startPipeline;   // 用真方法建 client
+    // 先让两个账户都处于冷却, startPipeline 就会跳过 notifystart 与长轮询的网络噪音
+    p8.data.accounts[0].ilink.pauseUntil = Date.now() + 60000;
+    p8.data.accounts[1].ilink.pauseUntil = Date.now() + 60000;
+    p8.startPipeline("a1");
+    p8.startPipeline("a2");
+    check("D18-3 a1 的 client 拿 a1 的 token/baseUrl", p8.pipelines.a1.client.token === "TOK-A" && p8.pipelines.a1.client.baseUrl === "https://a.example",
+      JSON.stringify([p8.pipelines.a1.client.token, p8.pipelines.a1.client.baseUrl]));
+    check("D18-3 a2 的 client 拿 a2 的 token/baseUrl(没有回落到 a1 的 key)",
+      p8.pipelines.a2.client.token === "TOK-B" && p8.pipelines.a2.client.baseUrl === "https://b.example",
+      JSON.stringify([p8.pipelines.a2.client.token, p8.pipelines.a2.client.baseUrl]));
+    check("D18-3 两条管道不是同一个 client(连接池各自独立)", p8.pipelines.a1.client !== p8.pipelines.a2.client);
+    check("D18-3 主人身份各是各的", p8.data.accounts[0].ilink.userId === "U1" && p8.data.accounts[1].ilink.userId === "U2");
+    p8.pipelines.a1.client.notify = () => {}; p8.pipelines.a2.client.notify = () => {};
+    p8.stopPipeline();
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

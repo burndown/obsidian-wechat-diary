@@ -248,7 +248,68 @@ plugin
 
 3. **管道按账户化**（`pipelines` 表 + `_handleIncoming(msg, account)` + 各自 `buf`/`pauseUntil`）
    → 用例 5/8/9。这一步风险最高（陌生人判定改错会让第二个账户完全收不到消息）。
+
+   **落地记录（2026-09-12，已实现，与第 4 步合并提交）**：`this.pipelines = { [id]: { client, running,
+   failCount, noticedDown, pollSettledTs, sleepCancels: Set, skippedCount } }`（见 `newPipelineState()`）；
+   方法签名落成 `startPipeline(id)` / `stopPipeline(id?)`（不传 = 全部停）/ `_loop(id)` /
+   `_handleIncoming(msg, id)` / `_isPaused(id)` / `_clearSkipBacklog(id?)` / `_interruptibleSleep(ms, id)`。
+   `_rebuildAccountServices()` 里加 `_reconcilePipelines()`：按账户对账 pipelines，**保留在跑的那条**
+   （第 5 步"添加账户"不能打断账户 #1），删掉已不存在的账户。`onload` 改为遍历账户逐个 `startPipeline(a.id)`。
+
+   **与规格的偏差**：
+   - **46 处单例引用改完后，main.js 内部 `this._client/_running/...` 只剩 QrLoginModal 自己的
+     `this._client`（那是扫码轮询的局部 client，与管道无关）**。但因为**既有 bindtest 断言直接读写
+     `p._client/_running/_pollSettledTs/_skipBacklog/_skippedCount/_declinedClaims`（一条都不许改）**，
+     补了 `installPipelineShim(plugin)`：把这些名字定义成**指向首个账户**的访问器。单账户下与旧行为
+     逐字等价；多账户下它们不再代表第二条管道（内部代码一律走 `pipelines[id]`）。与第 1/2 步的
+     `installAccountShim`/`installSettingsShim` 同一条纪律，第 5 步设置页改完后可删。
+   - **`skipBacklog` 的真源改成 `account.ilink.skipBacklog`（每账户），不再是实例布尔**。恢复分支与
+     `adoptOwner` 本来就写这个字段（且落盘），所以读完直接是它；`_skipBacklog` 只是首个账户的兼容视图。
+     跳过计数（诊断用、不必跨重启）放进 `pipelines[id].skippedCount`。
+   - **`_setStatus(text, id)`**：状态栏只有一个位置。单账户显示 `📖 微信日记: <text>`（与旧版逐字相同，
+     回归基线依赖它）；多账户显示 `📖 微信日记: N 个账户 · <label> <text>`——总数 + 最近一次状态变化
+     属于谁。不做轮播（会让人以为状态在跳），每账户详情留给第 5 步的设置页账户列表。
+   - 绑定生命周期按账户：`onLoginConfirmed(payload, id)` / `adoptOwner(userId, id)` /
+     `_askClaimOwner(from, id)` / `bindState(id)`（不传 = 首个账户）/ `QrLoginModal(app, plugin, accountId)`
+     （重扫码写回原槽，"添加账户"传新槽；设置页此刻仍不传 = 首个账户）。`_declinedClaims` 变成每账户一个
+     `Set`（`_declinedSet(id)`，`_declinedClaims` 是首个账户的兼容视图）。`onLoginConfirmed` 只停目标账户的
+     管道（重扫账户 A 不打断 B）。
+
+   **新坑（本步测试抓出来的，两个都与"还偷偷读全局垫片"有关）**：
+   1. **`DiaryAgent.onMessage` 的兜底白名单也在比 `this.plugin.data.ilink.userId`（= 账户 #1）**。
+      `_handleIncoming` 按账户放行之后，第二个账户的消息会在 agent 这一层被当陌生人丢掉 —— 症状正是
+      "第二个账户完全收不到消息"。修法：拿 `this.account.ilink.userId`（account 为 null 时才回落垫片）。
+      证据：把这一行退回全局垫片跑 D18-3，`a2 的消息写进 a2 的文件夹` 挂（写进了 `甲/…`），669/670。
+   2. **`DiaryAgent` 里下载媒体（语音原声/图片/语音兜底/文件视频）读的是 `this.plugin._client`**，
+      按账户化后那是账户 #1 的兼容视图 —— 第二个账户会拿**别人的 token/baseUrl** 去下载。新增
+      `_pipeClient()`（`plugin.pipelines[account.id].client`，account 为 null 时回落 `plugin._client`），
+      4 处全部改走它。
+   3. 另有一处**有意的偏差**：`fileMd5s`（附件去重表）在 §2 表里被列为"全局缓存"，但数据模型第 1 步
+      已把它放进 `account.ilink`。与其让第二个账户跨账户写账户 #1 的字段（它自己的表永远是空的），
+      不如按账户走（新增 `_ilink()`）——代价是"同一份文件从两个号发来各存一份"。彻底全局化要新增顶层
+      `data.fileMd5s`，属于数据模型变更，不在本轮。
+
 4. **提醒按账户化**（各读各自的时间与开关）→ 用例 6/13。
+
+   **落地记录（2026-09-12，已实现，与第 3 步合并提交）**：`_reminderTick()` 遍历账户，逐账户
+   `try/catch` 调 `_reminderTickOne(id)`（一个账户抛错不连累其余）。每账户：自己的 `pipelines[id]`
+   没在跑 / 没 settle / 被 `il.skipBacklog` 挡住 / 被自己的 `pauseUntil` 暂停 → 跳过；用
+   `_st("reminderEnabled"/"reminderTime", id)`（账户设了用账户、`undefined` 回落全局，`=== undefined`
+   判据保证账户的 `false` 压过全局的 `true`）；用 `this.writers[id].countDay()` **在它自己的日记树里数段**；
+   用自己的 `client` 发给自己 `il.userId`、带自己的 `contextToken`；`reminded_date`/`reminder_streak`/
+   `reminder_idx`/`reminder_last_result` 落自己的 `session`。新增 `_st(key, id)`（插件的账户设置解析，
+   与 `DiaryWriter._st`/`DiaryAgent._st` 同义）。
+
+   **与规格的偏差**：规格说的"账户有值用账户、`undefined` 回落全局"直接落成 `_st`；没有别的偏差。
+
+   **用例**：新增 `【D18-3】`（bindtest，24 条断言，覆盖规格 §6 的 5/6/8/9 + 各写各的树 + 凭据隔离）：
+   陌生人判定按账户（a2 的 userId 进 a1 管道 → 不写不回复；自己的 → 正常）、各写各的树（a2 的段落只出现在
+   `乙/`，`甲/` 里没有）、独立启停（`stopPipeline("a1")` 后 a2 仍在跑且 500ms 宽限后 client 没被 destroy）、
+   -14 冷却独立（a1 的 pauseUntil 变了、a2 的一动不动且提醒照发）、提醒各推各的（A 记了 B 没记 → 只提醒 B；
+   都空 → 各发各的；A 关提醒 → 即使空也不提醒 A）、提醒数的是自己那棵树（反向也测）、凭据隔离
+   （两条管道各自 token/baseUrl/userId，且不是同一个 client）。单账户零影响由既有 646 条兜底。
+   实测 `npm run verify`：bindtest **670**（646 + 24），webcliptest **92**，既有断言零删改。
+
 5. **设置页重构**：账户列表 + 选中账户编辑它那一套 + 添加/删除/重绑 + 两层同树校验
    → 用例 4/12 + 手测扫码。
 
