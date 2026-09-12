@@ -1637,6 +1637,95 @@ async function newPlugin(secrets, storedData) {
     check("D18 keepToken 保住了 token(无 secretStorage 的兜底路径)", pNo.getBotToken() === "TOK-F", pNo.getBotToken());
   }
 
+  console.log("\n【D18-2】每账户日记设置: writer/clipper/agent 按账户读自己的 diary(第 2 步)");
+  {
+    // 往一个已 onload 的插件里塞第二个账户再重建服务 —— 与第 5 步"添加账户"同一条路。
+    const addSecond = (p, diary) => {
+      p.data.accounts.push(I.newAccount("a2", "账户 2", diary));
+      p._rebuildAccountServices();
+      return p.data.accounts[1];
+    };
+
+    console.log("  — D18-2.1 两个账户各自一棵树");
+    const p1 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p1.data.accounts[0].diary.diaryFolder = "日记甲";
+    p1.data.accounts[0].diary.pathFormat = "YYYY/YYYY-MM-DD";
+    addSecond(p1, { diaryFolder: "日记乙", pathFormat: "YYYY/MM/DD" });
+    const path1 = p1.writers.a1.diaryPath("2026-09-10");
+    const path2 = p1.writers.a2.diaryPath("2026-09-10");
+    check("D18-2 两账户当天路径不同", path1 !== path2, JSON.stringify([path1, path2]));
+    check("D18-2 各自路径含自己的文件夹名", path1 === "日记甲/2026/2026-09-10.md" && path2 === "日记乙/2026/09/10.md", JSON.stringify([path1, path2]));
+    check("D18-2 兼容别名指向首个账户", p1.writer === p1.writers.a1 && p1.clipper === p1.clippers.a1 && p1.agent === p1.agents.a1);
+
+    console.log("  — D18-2.2 账户没设过 → 回落全局(a2 的 diary 是空的)");
+    const p2 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p2.settings.diaryFolder = "全局日记";
+    p2.settings.pathFormat = "YYYY/MM";
+    addSecond(p2, {});
+    check("D18-2 a2 的 diary 字段确实都没设过", p2.writers.a2._st("diaryFolder") === "全局日记" && p2.writers.a2._st("pathFormat") === "YYYY/MM");
+    check("D18-2 a2 没设过 → 路径按全局设置算", p2.writers.a2.diaryPath("2026-09-10") === "全局日记/2026/09.md", p2.writers.a2.diaryPath("2026-09-10"));
+
+    console.log("  — D18-2.3 账户设了 → 压过全局");
+    p2.data.accounts[1].diary.pathFormat = "YYYY-MM-DD";
+    p2._rebuildAccountServices();
+    check("D18-2 a2 设了 pathFormat → 账户赢", p2.writers.a2.diaryPath("2026-09-10") === "全局日记/2026-09-10.md", p2.writers.a2.diaryPath("2026-09-10"));
+    check("D18-2 a1(全局视图)不受 a2 影响", p2.writers.a1.diaryPath("2026-09-10") === "全局日记/2026/09.md", p2.writers.a1.diaryPath("2026-09-10"));
+
+    console.log("  — D18-2.4 附件目录独立");
+    const p4 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p4.data.accounts[0].diary.attachmentMode = "custom";
+    p4.data.accounts[0].diary.attachmentFolder = "甲附件";
+    addSecond(p4, { attachmentMode: "custom", attachmentFolder: "乙附件" });
+    const dirA = p4.writers.a1._attachmentDir("2026-09-10");
+    const dirB = p4.writers.a2._attachmentDir("2026-09-10");
+    check("D18-2 custom 附件目录各读各的", dirA === "甲附件/" && dirB === "乙附件/" && dirA !== dirB, JSON.stringify([dirA, dirB]));
+
+    console.log("  — D18-2.5 共用每日笔记独立");
+    const p5 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p5.settings.sharedDailyNote = true;
+    p5.settings.sectionHeading = "甲节";
+    addSecond(p5, { sharedDailyNote: false, sectionHeading: "微信随手记" });
+    check("D18-2 共用模式开关各读各的", p5.writers.a1._shared() === true && p5.writers.a2._shared() === false);
+    check("D18-2 节标题各读各的", p5.writers.a1._heading() === "甲节" && p5.writers.a2._heading() === "微信随手记", JSON.stringify([p5.writers.a1._heading(), p5.writers.a2._heading()]));
+
+    console.log("  — D18-2.6 剪藏目录/开关跟随账户");
+    const p6 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p6.data.accounts[0].diary.webClipFolder = "甲剪藏";
+    p6.data.accounts[0].diary.webClipEnabled = true;
+    addSecond(p6, { webClipFolder: "乙剪藏", webClipEnabled: false });
+    check("D18-2 剪藏目录跟随账户(落盘路径由 DiaryWriter 算)", p6.writers.a1.webClipFolder() === "甲剪藏" && p6.writers.a2.webClipFolder() === "乙剪藏", JSON.stringify([p6.writers.a1.webClipFolder(), p6.writers.a2.webClipFolder()]));
+    const p6b = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p6b.settings.diaryFolder = "甲日记";
+    p6b.settings.webClipFolder = "";   // 空 = 跟随各自日记根
+    addSecond(p6b, { diaryFolder: "乙日记" });
+    check("D18-2 剪藏目录为空时默认跟着各自日记根", p6b.writers.a1.webClipFolder() === "甲日记/剪藏" && p6b.writers.a2.webClipFolder() === "乙日记/剪藏", JSON.stringify([p6b.writers.a1.webClipFolder(), p6b.writers.a2.webClipFolder()]));
+    check("D18-2 剪藏开关也按账户解析", p6.agents.a1._st("webClipEnabled") === true && p6.agents.a2._st("webClipEnabled") === false);
+
+    console.log("  — D18-2.7 agent 拿的是自己账户的 writer/clipper/session");
+    const p7 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    addSecond(p7, { diaryFolder: "乙" });
+    check("D18-2 agents.a2.writer/clipper === 该账户的服务", p7.agents.a2.writer === p7.writers.a2 && p7.agents.a2.clipper === p7.clippers.a2);
+    check("D18-2 agents.a1 也各就各位", p7.agents.a1.writer === p7.writers.a1 && p7.agents.a1.profile === p7.data.accounts[0].profile);
+    const a1SessionBefore = p7.data.accounts[0].session.reminded_date;
+    p7.agents.a2.session.reminded_date = "2026-09-10";
+    p7.agents.a2.profile.name = "乙的名";
+    check("D18-2 a2 的 session/profile 写入落在 accounts[1], 不污染 a1",
+      p7.data.accounts[1].session.reminded_date === "2026-09-10" && p7.data.accounts[1].profile.name === "乙的名" &&
+      p7.data.accounts[0].session.reminded_date === a1SessionBefore && p7.data.accounts[0].profile.name !== "乙的名",
+      JSON.stringify([p7.data.accounts[0].session.reminded_date, p7.data.accounts[0].profile.name]));
+
+    console.log("  — D18-2.8 反向垫片: 设置页仍写全局 settings, 但必须落到账户 #1(writer 当场看得到)");
+    // 这是本步抓到的坑: 迁移把值(含默认值)拷成了账户里明确的值, 若 settings 不与账户 #1 连通,
+    // 设置页的改动会被账户里的旧快照盖住 —— 单账户用户会觉得"改了没反应"。
+    const p8 = await newPlugin({ [SECRET_TOKEN]: "TOK1" }, BOUND_DATA());
+    p8.settings.sharedDailyNote = true;
+    p8.settings.diaryFolder = "改过的";
+    check("D18-2 写 settings.sharedDailyNote 落在 accounts[0].diary", p8.data.accounts[0].diary.sharedDailyNote === true);
+    check("D18-2 writer 立刻读得到(不是被旧快照盖住)", p8.writers.a1._shared() === true && p8.writers.a1.diaryPath("2026-09-10") === "改过的/2026/2026-09-10.md", p8.writers.a1.diaryPath("2026-09-10"));
+    const p8disk = JSON.parse(JSON.stringify(p8.data));
+    check("D18-2 落盘仍有 settings 里那份(回退 0.4.0 时设置不丢)", p8disk.settings.diaryFolder === "改过的" && p8disk.settings.sharedDailyNote === true, JSON.stringify(p8disk.settings));
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);

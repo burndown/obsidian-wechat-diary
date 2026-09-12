@@ -219,6 +219,33 @@ plugin
 2. **每账户设置 + writer/clipper/agent 按账户**：`diary` 块（日记五项 / 附件三件 / 共用笔记三件 /
    提醒两项 / 剪藏七项）落地，`DiaryWriter` 与 `WebClipper` 改读账户的 diary（全局那份变成
    "新账户默认值"），`DiaryAgent` 按账户实例化 → 用例 3/7/10/12。
+
+   **落地记录（2026-09-10，已实现）**：`DiaryWriter(plugin, ai, account)` / `WebClipper(plugin, account)` /
+   `DiaryAgent(plugin, account)` 都接受账户，新增 `_st(key)`（账户有值用账户，`undefined` 回落全局）与
+   `_settingsView()`（把账户值覆盖到 settings 浅拷贝上，喂给 `defaultWebClipFolder` / `webClipMaxImages` /
+   `webClipMaxTotalImageBytes` / `shouldClipWebUrl` 这几个吃 "settings 形状" 的纯函数——最小改法：那些函数
+   签名不能动，webcliptest 直接测它们）。插件侧新增 `_rebuildAccountServices()`，`onload` 与 `unbind`
+   两处都走它；`writer`/`clipper`/`agent` 三个旧别名保留，仍指第一个账户（消息路由是第 3 步）。
+
+   **与规格的偏差**：
+   - 规格给的 `_st` 单独用会破坏单账户行为（见下面新坑），所以补了一个**反向垫片** `installSettingsShim`：
+     把 `settings` 上那 17 个键定义成指向 `accounts[0].diary` 的**可枚举访问器**。设置页第 5 步才改，
+     在那之前它写的仍是全局 `settings`；不接通两边，用户改设置会被账户里的旧快照盖住。可枚举是为了
+     `JSON.stringify` 照旧把值写回 `data.json`（回退 0.4.0 时 `settings.diaryFolder` 还在）。第 5 步删。
+   - `DiaryAgent` 也加了 `_st`/`_settingsView`（规格只要求 writer/clipper）：剪藏开关 `webClipEnabled`、
+     站点范围 `webClipOtherSites`、欢迎语里的 `diaryFolder` 都在 agent 路由上读，不按账户读第 3 步就会
+     拿错账户的开关。`this.plugin.clipper` 也换成 `this.clipper`（本账户的实例）。
+   - `WebClipper` 构造函数是 `(plugin, account, deps)`，并从 `account` 上兼容读一次旧签名的
+     `directImageRequest`（webcliptest 把注入点放在第 2 个参数；真实账户没有这个字段，不会混淆）。
+   - 用例 D18-2.6 断言的是 `writers[id].webClipFolder()` 而不是 `clippers[id].webClipFolder()`——
+     剪藏目录的落盘决策在 `DiaryWriter`，`WebClipper` 只抓正文，没有这个方法。
+
+   **新坑（本步测试抓出来的，和 §3.2 第一条同类）**：`_st` 的"账户值优先"会**把迁移后的全局设置盖住**。
+   迁移把全局值（含 `DEFAULT_SETTINGS` 里的默认值）原样拷成账户里**明确的**值，于是 `undefined` 回落
+   永远轮不到全局；而设置页此刻写的还是 `plugin.settings`。证据：把 `installSettingsShim` 注释掉跑 bindtest，
+   621/627——B15 的"改 `settings.sharedDailyNote` 后应按共用模式写"6 条全挂（写进了独立模式文件）。
+   修法就是上面那条反向垫片：单账户下 `settings` 与 `accounts[0].diary` 是同一份存储，两边读写都即时同步。
+
 3. **管道按账户化**（`pipelines` 表 + `_handleIncoming(msg, account)` + 各自 `buf`/`pauseUntil`）
    → 用例 5/8/9。这一步风险最高（陌生人判定改错会让第二个账户完全收不到消息）。
 4. **提醒按账户化**（各读各自的时间与开关）→ 用例 6/13。

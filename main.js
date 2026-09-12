@@ -3899,9 +3899,26 @@ function isBlockedByClientError(error) {
 }
 
 class WebClipper {
-  constructor(plugin, deps) {
+  // D18: 每个账户一个 clipper, account 为 null 时回落全局 settings。
+  // deps 是测试注入点(webcliptest 直接构造注入直连实现); 历史签名把它放在第 2 个参数上,
+  // 所以这里也从 account 上读一次 —— 真实账户没有 directImageRequest 字段, 两种形状不会混淆。
+  constructor(plugin, account, deps) {
     this.plugin = plugin;
-    this._directImageRequest = deps && deps.directImageRequest ? deps.directImageRequest : requestWebClipBinaryDirect;
+    this.account = account || null;
+    const injected = (deps && deps.directImageRequest) || (this.account && this.account.directImageRequest);
+    this._directImageRequest = injected || requestWebClipBinaryDirect;
+  }
+
+  // 语义与 DiaryWriter._st 逐字一致(见那里的注释)。
+  _st(key) {
+    const a = this.account;
+    const v = a && a.diary ? a.diary[key] : undefined;
+    return v === undefined ? this.plugin.settings[key] : v;
+  }
+  _settingsView() {
+    const view = Object.assign({}, this.plugin.settings);
+    for (const k of ACCOUNT_DIARY_FIELDS) view[k] = this._st(k);
+    return view;
   }
 
   async _fetchImage(image, referer, timeoutMs) {
@@ -4003,7 +4020,7 @@ class WebClipper {
     if (!html && res.arrayBuffer) html = Buffer.from(res.arrayBuffer).toString("utf8");
     if (!html) throw new WebClipError("empty", "网页没有返回内容");
     if (Buffer.byteLength(html, "utf8") > WEB_CLIP_MAX_HTML_BYTES) throw new WebClipError("too_large", "网页源码超过 5MB 上限");
-    const article = extractArticleFromHtml(html, url, this.plugin.settings.webClipMaxChars);
+    const article = extractArticleFromHtml(html, url, this._st("webClipMaxChars"));
     const bodyText = cleanMarkdown(article.markdown
       .replace(/!\[[^\]]*\]\(<[^>]+>\)/g, "")
       .replace(/%%WECHAT_DIARY_IMAGE_\d+%%/g, ""));
@@ -4011,12 +4028,13 @@ class WebClipper {
       throw new WebClipError("no_text", "没找到足够的正文，网页可能需要登录或 JavaScript 渲染");
     }
     const referencedImages = (article.images || []).filter((image) => article.markdown.includes(image.token));
-    if (this.plugin.settings.webClipSaveImages === false) {
+    if (this._st("webClipSaveImages") === false) {
       article.images = referencedImages.map((image) => ({ ...image, skipped: true }));
       return article;
     }
-    const maxImages = webClipMaxImages(this.plugin.settings);
-    const maxTotalImageBytes = webClipMaxTotalImageBytes(this.plugin.settings);
+    const clipView = this._settingsView();
+    const maxImages = webClipMaxImages(clipView);
+    const maxTotalImageBytes = webClipMaxTotalImageBytes(clipView);
     const maxTotalImageMb = Math.floor(maxTotalImageBytes / 1024 / 1024);
     const downloaded = new Array(referencedImages.length);
     for (let i = maxImages; i < referencedImages.length; i++) {
@@ -4402,17 +4420,34 @@ function sealContent(content, hhmm) {
 }
 
 class DiaryWriter {
-  constructor(plugin, ai) { this.plugin = plugin; this.ai = ai; }
+  // D18: 每个账户一个 writer, account 为 null 时全部回落全局 settings(等同于第 2 步之前的行为)。
+  constructor(plugin, ai, account) { this.plugin = plugin; this.ai = ai; this.account = account || null; }
+
+  // D18: 账户设置优先; 账户没设过(undefined)就落到全局那份(全局 = "新账户的默认值")。
+  // 读的地方仍沿用原来的 `|| 默认` / `=== true` / `!== false` 表达式, 所以语义不变。
+  _st(key) {
+    const a = this.account;
+    const v = a && a.diary ? a.diary[key] : undefined;
+    return v === undefined ? this.plugin.settings[key] : v;
+  }
+  // defaultWebClipFolder/webClipMaxImages/webClipMaxTotalImageBytes 是吃 "settings 形状" 对象的纯函数,
+  // 签名不能动(webcliptest 直接测它们)。把账户的 diary 字段解析后覆盖到一份浅拷贝上, 它们就跟着账户走,
+  // 不用给每个纯函数加 account 参数, 也不用在每个调用点各拼一遍。
+  _settingsView() {
+    const view = Object.assign({}, this.plugin.settings);
+    for (const k of ACCOUNT_DIARY_FIELDS) view[k] = this._st(k);
+    return view;
+  }
 
   // ── 路径层(#15/D13): 根目录 + 路径格式(moment) + 附件位置三模式。默认值 = 0.3.1 的固定布局。
   _root() {
-    const f = this.plugin.settings.diaryFolder || "日记";   // 兜底与 0.3.1 同款, 不多做清洗(设置页存进来的已 trim)
+    const f = this._st("diaryFolder") || "日记";   // 兜底与 0.3.1 同款, 不多做清洗(设置页存进来的已 trim)
     return f === "/" ? "" : normalizePath(f);   // "/" = 库根目录(核心每日笔记的默认位置)
   }
-  _fmt() { return this.plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat; }
+  _fmt() { return this._st("pathFormat") || DEFAULT_SETTINGS.pathFormat; }
   _join(root, rel) { return normalizePath(root ? root + "/" + rel : rel); }
-  _shared() { return !!this.plugin.settings.sharedDailyNote; }
-  _heading() { return String(this.plugin.settings.sectionHeading || DEFAULT_SETTINGS.sectionHeading).trim() || DEFAULT_SETTINGS.sectionHeading; }
+  _shared() { return !!this._st("sharedDailyNote"); }
+  _heading() { return String(this._st("sectionHeading") || DEFAULT_SETTINGS.sectionHeading).trim() || DEFAULT_SETTINGS.sectionHeading; }
 
   diaryPath(dateStr) {
     return this._join(this._root(), renderPath(this._fmt(), dateStr, moment) + ".md");
@@ -4420,11 +4455,10 @@ class DiaryWriter {
 
   // 附件目录: diary(现状)= 日记/attachments/2026; custom = 用户格式串渲染; obsidian 模式在 resolveAttachmentPath 里换算
   _attachmentDir(dateStr) {
-    const st = this.plugin.settings;
-    const mode = st.attachmentMode || "diary";
+    const mode = this._st("attachmentMode") || "diary";
     if (mode === "custom") {
-      const folder = String(st.attachmentFolder || "").trim();
-      const sub = String(st.attachmentSubFormat || "").trim();
+      const folder = String(this._st("attachmentFolder") || "").trim();
+      const sub = String(this._st("attachmentSubFormat") || "").trim();
       const base = folder === "/" ? "" : (folder ? normalizePath(folder) : "");
       const rel = sub ? renderPath(sub, dateStr, moment) : "";
       if (base || rel) return this._join(base, rel);   // 都没选 → 落到默认位置
@@ -4435,7 +4469,7 @@ class DiaryWriter {
   // 「跟随 Obsidian 的附件设置」: 用官方接口按用户设置(库根/指定文件夹/当前文件旁/子文件夹)换算, 它自建目录并去重文件名。
   // 来源文件不存在时接口会退到库根目录, 所以共用模式下先把当天的每日笔记建出来(带模板)再问它。
   async resolveAttachmentPath(dateStr, path) {
-    if ((this.plugin.settings.attachmentMode || "diary") !== "obsidian") return path;
+    if ((this._st("attachmentMode") || "diary") !== "obsidian") return path;
     const fm = this.plugin.app.fileManager;
     if (!fm || typeof fm.getAvailablePathForAttachment !== "function") return path;
     const day = dateStr || logicalTodayStr();
@@ -4456,7 +4490,7 @@ class DiaryWriter {
   }
 
   webClipFolder() {
-    return normalizePath(this.plugin.settings.webClipFolder || defaultWebClipFolder(this.plugin.settings));
+    return normalizePath(this._st("webClipFolder") || defaultWebClipFolder(this._settingsView()));
   }
 
   webClipPath(article, dateStr) {
@@ -4789,7 +4823,7 @@ class DiaryWriter {
     const path = this.diaryPath(day);
     const heading = this._heading();
     let tpl = "";
-    const tp = String(this.plugin.settings.templatePath || "").trim();
+    const tp = String(this._st("templatePath") || "").trim();
     if (tp) {
       const tf = vault.getFileByPath(normalizePath(tp));
       let problem = "";
@@ -5405,18 +5439,36 @@ class ILinkClient {
 
 class DiaryAgent {
   // plugin 提供: settings / persist() / data.profile / data.session / ai / writer / chatHandler
-  constructor(plugin) {
+  // D18: 每个账户一个 agent, 拿到的是该账户自己的 writer/clipper 与 profile/session。
+  // account 为 null 时全部回落到插件上的兼容别名与垫片(等同于第 2 步之前的行为)。
+  constructor(plugin, account) {
     this.plugin = plugin;
+    this.account = account || null;
     this.ai = plugin.ai;
-    this.writer = plugin.writer;
+    this.writer = (account && plugin.writers && plugin.writers[account.id]) || plugin.writer;
+    this.clipper = (account && plugin.clippers && plugin.clippers[account.id]) || plugin.clipper;
     this.chatHandler = plugin.chatHandler;
     this.offlineNotice = null; // 启动时算好, 第一条回复后清空
   }
 
-  get profile() { return this.plugin.data.profile; }
-  get session() { return this.plugin.data.session; }
+  // 语义与 DiaryWriter._st 逐字一致(见那里的注释)。agent 也要按账户读: 剪藏开关/站点范围在路由里判断,
+  // 欢迎语要报该账户的日记文件夹。
+  _st(key) {
+    const a = this.account;
+    const v = a && a.diary ? a.diary[key] : undefined;
+    return v === undefined ? this.plugin.settings[key] : v;
+  }
+  _settingsView() {
+    const view = Object.assign({}, this.plugin.settings);
+    for (const k of ACCOUNT_DIARY_FIELDS) view[k] = this._st(k);
+    return view;
+  }
 
-  _welcome() { return this.writer._shared() ? welcomeTextShared(this.writer._heading()) : welcomeText(this.plugin.settings.diaryFolder || "日记"); }
+  // profile/session 解析到本 agent 的账户; 没有 account 时回落插件垫片(第 2 步两者等价)。
+  get profile() { const a = this.account; return a && a.profile ? a.profile : this.plugin.data.profile; }
+  get session() { const a = this.account; return a && a.session ? a.session : this.plugin.data.session; }
+
+  _welcome() { return this.writer._shared() ? welcomeTextShared(this.writer._heading()) : welcomeText(this._st("diaryFolder") || "日记"); }
 
   // 跨天处理(020「午夜割裂」修复: 宽限期 + 显式告知)。
   // 返回 { graceDate?: string, expiredNotice?: string }
@@ -5496,7 +5548,7 @@ class DiaryAgent {
 
     for (const url of picked) {
       try {
-        const article = await this.plugin.clipper.fetchArticle(url);
+        const article = await this.clipper.fetchArticle(url);
         const res = await this.writer.saveWebClip(article, noteWritten ? "" : note, dateStr);
         if (!res.path) {
           failed.push({ url, reason: res.diskFull ? "磁盘空间不足" : "保存剪藏文件失败" });
@@ -5754,8 +5806,8 @@ class DiaryAgent {
     }
 
     // 剪藏默认关(D14); 开了也只剪藏公众号链接，其它网址保持原句记录，除非用户主动打开扩展开关。
-    if (!det.forced && !isVoice && this.plugin.settings.webClipEnabled === true) {
-      const links = extractWebUrls(text).filter((url) => shouldClipWebUrl(url, this.plugin.settings));
+    if (!det.forced && !isVoice && this._st("webClipEnabled") === true) {
+      const links = extractWebUrls(text).filter((url) => shouldClipWebUrl(url, this._settingsView()));
       if (links.length) return this._clipLinks(text, links);
     }
 
@@ -6789,6 +6841,28 @@ function installAccountShim(data) {
   }
 }
 
+// D18 第 2 步的反向垫片。设置页要到第 5 步才改成"编辑选中账户", 在那之前它写的仍是全局 settings;
+// 而 writer/clipper 从这一步起读账户的 diary。不把两边接起来, 单账户用户改设置会"没反应"——
+// 迁移把值(含默认值)原样拷成了账户里**明确的值**, 于是 `_st` 的 undefined 回落永远轮不到全局。
+// 所以把这 17 个键在 settings 上定义成指向 accounts[0].diary 的访问器:
+//   - 设置页/测试照旧写 settings.X → 落在账户 #1 上, writer 当场看得到;
+//   - 反方向(改账户 #1 的 diary)也立刻反映到 settings, 两边不会各说各话;
+//   - 必须是**可枚举**的: JSON.stringify 会调用 getter 把值写回 data.json, 磁盘形状与今天一致
+//     (老用户回退到 0.4.0 时 settings.diaryFolder 还在, 不会忽然变默认)。
+// 第 5 步设置页改完 + 账户 #2 真正落地后, 这段连同 installAccountShim 一起删。
+function installSettingsShim(settings, data) {
+  if (!settings || typeof settings !== "object") return;
+  const first = () => (data.accounts && data.accounts[0]) || null;
+  for (const k of ACCOUNT_DIARY_FIELDS) {
+    Object.defineProperty(settings, k, {
+      configurable: true,
+      enumerable: true,   // 见上: 必须落回 data.json
+      get() { const a = first(); return a && a.diary ? a.diary[k] : undefined; },
+      set(v) { const a = first(); if (a && a.diary) a.diary[k] = v; },
+    });
+  }
+}
+
 class WechatDiaryPlugin extends Plugin {
   async onload() {
     const stored = (await this.loadData()) || {};
@@ -6834,10 +6908,9 @@ class WechatDiaryPlugin extends Plugin {
     }
 
     this.ai = new AiClient(this);
-    this.writer = new DiaryWriter(this, this.ai);
-    this.clipper = new WebClipper(this);
     this.chatHandler = new ChatHandler(this.ai);
-    this.agent = new DiaryAgent(this);
+    // D18: 每账户一套服务(必须在 this.ai / this.chatHandler 就绪之后: DiaryAgent 要拿它们)
+    this._rebuildAccountServices();
 
     this._running = false;
     this._client = null;
@@ -6954,6 +7027,8 @@ class WechatDiaryPlugin extends Plugin {
       : [newAccount(FIRST_ACCOUNT_ID, "账户 1", accountDiaryFromSettings(this.settings))];
     this.data.activeAccount = this.data.activeAccount || this.data.accounts[0].id;
     installAccountShim(this.data);   // 必须在迁移之后: 迁移读的是还在 data 上的旧字段
+    // 反向垫片: 设置页暂时仍写全局 settings, 让它落在账户 #1 的 diary 上(见 installSettingsShim)
+    installSettingsShim(this.settings, this.data);
     return mig.migrated;
   }
 
@@ -6966,6 +7041,23 @@ class WechatDiaryPlugin extends Plugin {
     if (cur && this.accountById(cur)) return cur;
     const f = this.firstAccount();
     return (f && f.id) || FIRST_ACCOUNT_ID;
+  }
+
+  // D18 第 2 步: 每账户一套 writer/clipper/agent。**凡是把 this.data 整个换掉的地方都要重跑它** ——
+  // unbind 会把 data 换成 DEFAULT_DATA(), 旧服务对象还指着旧账户(第 1 步已经在垫片上踩过一次同类坑)。
+  // 第 2 步只有账户 #1 在实际跑(消息路由是第 3 步), 所以 writer/clipper/agent 三个旧别名一律还指第一个账户。
+  _rebuildAccountServices() {
+    this.writers = {}; this.clippers = {}; this.agents = {};
+    for (const a of (this.data.accounts || [])) {
+      this.writers[a.id] = new DiaryWriter(this, this.ai, a);
+      this.clippers[a.id] = new WebClipper(this, a);
+      this.agents[a.id] = new DiaryAgent(this, a);
+    }
+    // 兼容别名: 第 2 步只有账户 #1 在实际跑(消息路由是第 3 步), 旧调用点一律还指它
+    const f = this.firstAccount();
+    this.writer = f ? this.writers[f.id] : null;
+    this.clipper = f ? this.clippers[f.id] : null;
+    this.agent = f ? this.agents[f.id] : null;
   }
 
   getBotToken(id) {
@@ -7126,6 +7218,8 @@ class WechatDiaryPlugin extends Plugin {
     this.data.settings = keep;
     this.settings = keep;
     this._installAccounts();   // D18: data 被整个换掉了, 账户层与垫片要重装(见 _installAccounts)
+    // 上面换的是 data, 服务对象还指着旧账户 —— 必须跟着重建, 否则 writer/agent 读的是被丢掉那份
+    this._rebuildAccountServices();
     // 必须在重置 data 之后写: 没有 secretStorage 的宿主上 token 就落在 data.ilink 里,
     // 先写会被 DEFAULT_DATA() 抹掉 —— keepToken 会变成静默失效。
     this.setBotToken(token);
@@ -7539,7 +7633,7 @@ WechatDiaryPlugin.__internals = {
   texts2: { REMINDER_LINES, FILE_DUP_KEY_REPLY, FILE_TOO_BIG_REPLY, VOICE_FALLBACK_FAIL_REPLY,
     VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
   // D18 账户层(第 1 步)
-  migrateAccounts, accountDiaryFromSettings, newAccount, installAccountShim,
+  migrateAccounts, accountDiaryFromSettings, newAccount, installAccountShim, installSettingsShim,
   ACCOUNT_DIARY_FIELDS, FIRST_ACCOUNT_ID, ACCOUNT_TOKEN_KEY, ACCOUNT_IDENTITY_KEY,
   DEFAULT_DATA,
 };
