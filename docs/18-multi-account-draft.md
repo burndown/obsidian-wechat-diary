@@ -414,3 +414,37 @@ plugin
 
 每步一个提交，**第 1 步合进去不改变任何行为**，2 之后随时可停（第 2 步做完就已经"两个账户各写各的树"，
 只是还不能同时在线）。
+
+**五步全部实现（2026-09-10）**：bindtest 585 → 627 → 646 → 670 → **739**，webcliptest 全程 **92** 不动，
+每一步既有断言**零删改**。决策记录见 `00-decisions.md` D15。
+
+---
+
+## 9. 落地后剩下的
+
+### 9.1 待拆：三个兼容垫片
+
+`installAccountShim` / `installSettingsShim` / `installPipelineShim`（见 §3.1 与各步落地记录、
+`00-decisions.md` D15 的表）。它们是"每一步都不改既有断言"这个验证策略的代价，**不是设计的一部分**。
+
+拆它们要连带改掉既有断言里对旧字段名的引用（`p.data.ilink` 约 39 处、`p._client` / `p._running` /
+`p._pollSettledTs` / `p._skipBacklog`、`p._stored.accounts[0].ilink`、以及"改 `plugin.settings` 后
+应按共用模式写"那 6 条 B15）。建议单独一轮做，验收标准就是"拆完 `verify` 仍全过"。
+
+### 9.2 待手工验证（自动测不到的部分）
+
+设置页 DOM 不渲染、扫码要真机。第 5 步的变异验证已经确认**哪几处接线没有被用例覆盖**：
+
+- 行内文件夹选择器的同树拒绝（把它改坏，739 条**全过**——说明没兜住）
+- 账户列表的渲染与"点行切换"（含：点输入框不会重画、打字不丢焦点）
+- 添加账户 → 立刻扫码 → `onLoginConfirmed(payload, newId)` 写进**新槽**；到第 6 个是否 `Notice`
+- 重新扫码把绑写回**原槽**（不新建账户、不串 token）
+- 删除账户的二次确认、以及"vault 文件一个没动"
+- `_warnTreeConflicts` 的真实提示时机（手改 `data.json` 造同树后重启）
+- 多账户时的行高与滚动位置
+
+### 9.3 如果以后要时区 / 一天边界也按账户
+
+那是"把时间底座改成可传参"的**独立一轮**：`_dateFmt` / `_timeFmt` / `_weekdayFmt` / `_dayStartHour` /
+`_nudgeNightHour` 现在全是模块级状态，被 `todayStr`/`hhmmStr`/`weekdayForDate`/`logicalTodayStr`/
+`isNightNow`/`reminderDue` 直接读。与本次重构解耦，别混着做。
