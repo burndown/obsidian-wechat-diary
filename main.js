@@ -2365,6 +2365,8 @@ const ACCOUNT_DIARY_FIELDS = [
   "reminderEnabled", "reminderTime",
   "webClipEnabled", "webClipOtherSites", "webClipFolder", "webClipSaveImages",
   "webClipMaxImages", "webClipMaxTotalImageMb", "webClipMaxChars",
+  // D15 补(2026-09-12): 写进笔记属性 frontmatter 的 author。按账户 —— 两个微信号可以是两个人。
+  "author",
 ];
 
 const LONG_POLL_TIMEOUT_MS = 35000;
@@ -3750,6 +3752,16 @@ function webClipIdentityUrl(article) {
 
 function yamlString(value) { return JSON.stringify(String(value || "")); }
 
+// frontmatter 是 YAML: 值里出现 YAML 的特殊字符(冒号/井号/引号/括号/逗号…)或首尾空白时**必须加引号**,
+// 否则整份 frontmatter 会解析失败 —— Obsidian 的属性面板会退化成一坨文本, 用户的库就花了。
+// 常见的纯名字/中文直接裸写(与既有的 date/weekday/source 三行风格一致)。
+function yamlScalar(value) {
+  const s = String(value == null ? "" : value);
+  if (!s) return '""';
+  const bare = /^[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9_\u4e00-\u9fff.\- ]*$/.test(s) && s === s.trim();
+  return bare ? s : yamlString(s);
+}
+
 function formatWebClipMarkdown(article, note, clippedAt) {
   const title = article.title || "网页剪藏";
   const displayTitle = escapeWebText(title).replace(/\n+/g, " ").trim() || "网页剪藏";
@@ -4916,20 +4928,49 @@ class DiaryWriter {
   _appendRaw(day, timestamp, block) {
     return this._editDay(day, (existing) => {
       if (existing) {
-        const chunk = canMergeIntoLastHeader(existing, timestamp)
+        // D15 补: 已有文件里缺 author 就补一行(否则用户设了作者要等跨天才看得到)。
+        // 共用模式下 _ensureAuthor 原样返回 —— 那份文件不吃我们的 frontmatter。
+        const base = this._ensureAuthor(existing);
+        const chunk = canMergeIntoLastHeader(base, timestamp)
           ? "\n" + block + "\n"
           : "\n\n**" + timestamp + "**\n\n" + block + "\n";
-        return existing + chunk;
+        return base + chunk;
       }
       if (this._shared()) return "**" + timestamp + "**\n\n" + block + "\n";
-      const header = "---\n" +
-        "date: " + day + "\n" +
-        "weekday: " + weekdayForDate(day) + "\n" +
-        "source: wechat-diary\n" +
-        "---\n\n" +
-        "# " + day + "\n";
-      return header + "\n\n**" + timestamp + "**\n\n" + block + "\n";
+      return this._frontmatter(day) + "\n\n**" + timestamp + "**\n\n" + block + "\n";
     }, { create: true });
+  }
+
+  // 该账户配的作者名(空 = 不写 author 属性)。读法与别的日记设置一致: 账户有值用账户, 否则回落全局。
+  _author() { return String(this._st("author") || "").trim(); }
+
+  // 独立模式新建文件时的文件头。**没配 author 时与 0.3.1 逐字相同**(黄金回归盯着这一点)。
+  _frontmatter(day) {
+    let fm = "---\n" +
+      "date: " + day + "\n" +
+      "weekday: " + weekdayForDate(day) + "\n" +
+      "source: wechat-diary\n";
+    const author = this._author();
+    if (author) fm += "author: " + yamlScalar(author) + "\n";
+    return fm + "---\n\n# " + day + "\n";
+  }
+
+  // 给已有文件补 author(只补缺失的那个字段)。三条纪律:
+  // ① **已有 author 绝不覆盖** —— 那可能是用户自己写的, 也可能是模板带的不同值;
+  // ② 没有 frontmatter 就不动(外来文件/用户自建的文件由他自己管);
+  // ③ 共用每日笔记模式**完全不碰** —— 契约承诺插件只动「## 微信随手记」一节(见 data-contract v1.7)。
+  // 正文一个字节不动, 所以段数/撤回/封存都不受影响。
+  _ensureAuthor(content) {
+    const author = this._author();
+    if (!author || this._shared()) return content;
+    const end = frontmatterEnd(content);
+    if (!end) return content;
+    const fm = content.slice(0, end);
+    if (/^author[ \t]*:/m.test(fm)) return content;      // 已有(不管值是什么) → 不覆盖
+    const m = /(^|\n)(---[ \t]*\r?\n)$/.exec(fm);
+    if (!m) return content;
+    const nl = fm.includes("\r\n") ? "\r\n" : "\n";       // 跟文件本身的换行符, 不制造混合行尾
+    return fm.slice(0, m.index) + m[1] + "author: " + yamlScalar(author) + nl + m[2] + content.slice(end);
   }
 
   // 写一条。返回 { reply, n }。永不抛。
@@ -6659,6 +6700,21 @@ class WechatDiarySettingTab extends PluginSettingTab {
         }));
     }
 
+    // D15 补: 作者名 —— 写进该账户日记文件的 frontmatter `author`。留空 = 不写这一行(与旧版逐字相同)。
+    new Setting(containerEl)
+      .setName("作者")
+      .setDesc("留空则不写。填了之后, 这个账户新建的日记文件会在属性里带上 author(如 duan / heigao); "
+        + "已有文件缺这一项时也会补上——只补缺失的, 不会覆盖你手写的 author。"
+        + "开了「写进已有的每日笔记」时不生效: 那份文件的属性归你/模板管, 插件只动「" + this._writer()._heading() + "」一节。")
+      .addText((t) => t.setPlaceholder("duan").setValue(st.author || "")
+        .onChange(async (v) => {
+          // 首尾空白和换行会写坏 YAML 属性, 这里直接拒掉(值本身由 yamlScalar 兜底加引号)
+          const raw = String(v == null ? "" : v);
+          if (/[\r\n]/.test(raw)) { new Notice("作者不能换行, 没有保存"); t.setValue(st.author || ""); return; }
+          st.author = raw.trim();
+          await plugin.persist();
+        }));
+
     new Setting(containerEl).setName("链接剪藏").setHeading();
     new Setting(containerEl)
       .setName("自动提取公众号正文")
@@ -8186,7 +8242,7 @@ WechatDiaryPlugin.__internals = {
     VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
   // D18 账户层(第 1 步)
   migrateAccounts, accountDiaryFromSettings, newAccount, installAccountShim, installSettingsShim,
-  ACCOUNT_DIARY_FIELDS, FIRST_ACCOUNT_ID, ACCOUNT_TOKEN_KEY, ACCOUNT_IDENTITY_KEY,
+  ACCOUNT_DIARY_FIELDS, FIRST_ACCOUNT_ID, ACCOUNT_TOKEN_KEY, ACCOUNT_IDENTITY_KEY, yamlScalar,
   // D18 第 5 步: 两层同树校验 + 账户增删的纯逻辑
   validateAccountTree, normalizeAccountFolder, accountDayPath,
   nextAccountId, nextAccountLabel, defaultAccountFolder, MAX_ACCOUNTS,

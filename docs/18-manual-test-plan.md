@@ -1,7 +1,7 @@
-# #18 多账户 · 真机测试计划（0.5.0-beta.2）
+# #18 多账户 · 真机测试计划（0.5.0-beta.3）
 
 > 面向：谷雨，在自己真实的库 + 两个真实微信号上验。
-> 分支 `feat/multi-account`，版本 `0.5.0-beta.2`（**预发布**，不动 `main`——`main` 仍是上游 0.4.0）。
+> 分支 `feat/multi-account`，版本 `0.5.0-beta.3`（**预发布**，不动 `main`——`main` 仍是上游 0.4.0）。
 > 设计稿 `18-multi-account-draft.md`；决策 `00-decisions.md` D15。
 > 自动测已覆盖 744 条（bindtest）+ 92 条（webcliptest）；**本文件的重点正是那些自动测不到的**（§5）。
 >
@@ -37,7 +37,7 @@ grep '"version"' $PLUGIN/manifest.json
 
 ```fish
 for f in main.js manifest.json styles.css
-    curl -fsSL -o $PLUGIN/$f https://github.com/burndown/obsidian-wechat-diary/releases/download/0.5.0-beta.2/$f
+    curl -fsSL -o $PLUGIN/$f https://github.com/burndown/obsidian-wechat-diary/releases/download/0.5.0-beta.3/$f
 end
 ```
 
@@ -50,14 +50,14 @@ end
 <summary>方式 B：装了 <code>gh</code> 的话（一行）</summary>
 
 ```fish
-gh release download 0.5.0-beta.2 --repo burndown/obsidian-wechat-diary -D $PLUGIN --clobber
+gh release download 0.5.0-beta.3 --repo burndown/obsidian-wechat-diary -D $PLUGIN --clobber
 ```
 </details>
 
 <details>
 <summary>方式 C：BRAT</summary>
 
-BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，**并允许预发布版本**（`0.5.0-beta.2` 是
+BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，**并允许预发布版本**（`0.5.0-beta.3` 是
 Pre-release，不开这个开关 BRAT 找不到它）。四个 AI 版本的 Release 已经删掉，所以不会再装错成别的版本。
 </details>
 
@@ -154,6 +154,17 @@ end
 |---|---|---|
 | G1 | `Ctrl/Cmd+Shift+I` 打开控制台，过滤 `wechat-diary` | 没有红色报错；有的话整段复制 |
 | G2 | 看 `data.json` 里两个账户的 `ilink.buf` | 两条都在**推进**（说明两条长轮询都活着）；若某个卡住不动 → 那条管道死了 |
+
+### H. 笔记属性 author（beta.3 新增）
+
+| # | 怎么做 | 期望 | 取证 |
+|---|---|---|---|
+| H1 | 设置页：账户 1 的「作者」填 `heigao`、账户 2 填 `duan` | 两项都存住（切账户来回切还在） | 截图 |
+| H2 | 两个号各发一条（**当天文件已经存在**的情况） | 两个文件**被补上**各自的 `author` —— 不用等跨天 | 两个文件的 frontmatter |
+| H3 | 看 Obsidian 的属性面板 | `author` 是一个正常属性（不是一坨退化的文本） | 截图 |
+| H4 | 手改某个文件的 `author: 别人`，再从那个号发一条 | **不被覆盖**（还是你手写的值） | 文件片段 |
+| H5 | 把某账户的「作者」清空，发一条到**新的一天** | 新文件**没有** author 行（不多写一行） | 文件片段 |
+| H6 | （若开了「写进已有的每日笔记」）发一条 | 你自己的每日笔记**属性里不被插入 author**，插件只动 `「微信随手记」` 一节 | 文件片段 |
 
 ## 5. 自动测覆盖不到、这次重点看的地方
 

@@ -2117,6 +2117,121 @@ async function newPlugin(secrets, storedData) {
       JSON.stringify(pBad.data.accounts.map((a) => a.diary.diaryFolder)));
   }
 
+  console.log("\n【D15-author】笔记属性 author: 按账户写进 frontmatter(2026-09-12)");
+  {
+    const RDate3 = Date;
+    let dNow3 = RDate3.parse("2026-09-14T10:00:00+08:00");
+    class DDate3 extends RDate3 {
+      constructor(...a) { if (a.length) super(...a); else super(dNow3); }
+      static now() { return dNow3; }
+    }
+    global.Date = DDate3;
+    I.setDayStartHour(4);
+    const DAY3 = "2026-09-14";
+    const WD = I.weekdayForDate(DAY3);
+    function dv3() {
+      const files = {};
+      return {
+        files,
+        getFileByPath: (x) => (x in files ? { path: x } : null),
+        getAbstractFileByPath: (x) => (x in files ? { path: x } : null),
+        getFolderByPath: () => ({}), createFolder: async () => {},
+        create: async (x, c) => { files[x] = c; },
+        process: async (f, fn) => { files[f.path] = fn(files[f.path]); return files[f.path]; },
+        cachedRead: async (f) => files[f.path],
+      };
+    }
+    try {
+      console.log("  — author 值要安全(不然 Obsidian 的属性面板会退化成文本)");
+      check("author yamlScalar 普通名字裸写", I.yamlScalar("duan") === "duan" && I.yamlScalar("heigao") === "heigao");
+      check("author yamlScalar 中文裸写", I.yamlScalar("黑高") === "黑高", I.yamlScalar("黑高"));
+      check("author yamlScalar 中间有空格仍裸写", I.yamlScalar("Zhang San") === "Zhang San");
+      check("author yamlScalar 冒号 → 加引号", I.yamlScalar("a: b") === '"a: b"', I.yamlScalar("a: b"));
+      check("author yamlScalar 井号 → 加引号", I.yamlScalar("a#b") === '"a#b"');
+      check("author yamlScalar 引号 → 加引号并转义", I.yamlScalar('"q"') === '"\\"q\\""', I.yamlScalar('"q"'));
+      check("author yamlScalar 首尾空白 → 加引号", I.yamlScalar("  x  ") === '"  x  "', I.yamlScalar("  x  "));
+      check("author yamlScalar 短横开头 → 加引号", I.yamlScalar("-x") === '"-x"');
+      check("author yamlScalar 空值给空串", I.yamlScalar("") === '""' && I.yamlScalar(null) === '""');
+
+      console.log("  — 新建文件: author 的位置与\"没配就一字不多\"");
+      const v1 = dv3();
+      const W1 = new I.DiaryWriter({ app: { vault: v1 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "duan" } });
+      const p1 = W1.diaryPath(DAY3);
+      await W1.write("第一条", false, DAY3);
+      check("author 新建文件: 在 source 之后、--- 之前",
+        v1.files[p1].startsWith("---\ndate: " + DAY3 + "\nweekday: " + WD + "\nsource: wechat-diary\nauthor: duan\n---\n\n# " + DAY3 + "\n"),
+        JSON.stringify(v1.files[p1].slice(0, 130)));
+      const v0 = dv3();
+      const W0 = new I.DiaryWriter({ app: { vault: v0 }, settings: {} }, null, { id: "a1", label: "甲", diary: {} });
+      const p0 = W0.diaryPath(DAY3);
+      await W0.write("第一条", false, DAY3);
+      check("author 没配时文件头与旧版逐字相同(不多一行)",
+        v0.files[p0].startsWith("---\ndate: " + DAY3 + "\nweekday: " + WD + "\nsource: wechat-diary\n---\n\n# " + DAY3 + "\n"),
+        JSON.stringify(v0.files[p0].slice(0, 130)));
+      check("author 没配时全文不含 author", !v0.files[p0].includes("author"));
+
+      console.log("  — 已有文件补一行(否则设了作者要等跨天才看到)");
+      const v2 = dv3();
+      const W2 = new I.DiaryWriter({ app: { vault: v2 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "heigao" } });
+      const p2 = W2.diaryPath(DAY3);
+      v2.files[p2] = "---\ndate: " + DAY3 + "\nsource: wechat-diary\n---\n\n# " + DAY3 + "\n\n\n**10:00**\n\n老内容\n";
+      const r2 = await W2.write("新内容", false, DAY3);
+      check("author 已有文件补上了", v2.files[p2].includes("author: heigao\n---\n"), v2.files[p2]);
+      check("author 补行后正文一字不动", v2.files[p2].includes("老内容") && v2.files[p2].includes("新内容"));
+      check("author 补行不影响段数", r2.n === 2, String(r2.n));
+      const v3 = dv3();
+      const W3 = new I.DiaryWriter({ app: { vault: v3 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "heigao" } });
+      const p3 = W3.diaryPath(DAY3);
+      v3.files[p3] = "---\ndate: " + DAY3 + "\nsource: wechat-diary\nauthor: someone-else\n---\n\n# x\n\n\n**10:00**\n\n内容\n";
+      await W3.write("再加一条", false, DAY3);
+      check("author 已存在 → 绝不覆盖(那可能是用户手写的)",
+        v3.files[p3].includes("author: someone-else") && !v3.files[p3].includes("author: heigao"), v3.files[p3]);
+
+      console.log("  — 边界: 共用模式 / 无 frontmatter / 特殊字符 / CRLF");
+      const v4 = dv3();
+      const W4 = new I.DiaryWriter({ app: { vault: v4 }, settings: {} }, null,
+        { id: "a1", label: "甲", diary: { author: "duan", sharedDailyNote: true, sectionHeading: "微信随手记" } });
+      const p4 = W4.diaryPath(DAY3);
+      v4.files[p4] = "# 我的笔记\n\n## 微信随手记\n\n**09:12**\n\n既有内容\n";
+      await W4.write("节里再加一条", false, DAY3);
+      check("author 共用模式: 用户文件的属性不被插入 author",
+        !v4.files[p4].includes("author:") && v4.files[p4].startsWith("# 我的笔记") && v4.files[p4].includes("节里再加一条"), v4.files[p4]);
+      const v5 = dv3();
+      const W5 = new I.DiaryWriter({ app: { vault: v5 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "duan" } });
+      const p5 = W5.diaryPath(DAY3);
+      v5.files[p5] = "# 用户自己的文件\n\n**10:00**\n\n内容\n";
+      await W5.write("再来", false, DAY3);
+      check("author 没有 frontmatter → 不插入", !v5.files[p5].includes("author"), v5.files[p5]);
+      const v6 = dv3();
+      const W6 = new I.DiaryWriter({ app: { vault: v6 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "a: b" } });
+      const p6 = W6.diaryPath(DAY3);
+      await W6.write("内容", false, DAY3);
+      check("author 含特殊字符 → frontmatter 里自动加引号", v6.files[p6].includes('author: "a: b"'), JSON.stringify(v6.files[p6].slice(0, 130)));
+      const v7 = dv3();
+      const W7 = new I.DiaryWriter({ app: { vault: v7 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "duan" } });
+      const p7 = W7.diaryPath(DAY3);
+      v7.files[p7] = "---\r\ndate: " + DAY3 + "\r\nsource: wechat-diary\r\n---\r\n\r\n# x\r\n\r\n\r\n**10:00**\r\n\r\n内容\r\n";
+      await W7.write("再来", false, DAY3);
+      check("author CRLF 文件补行也用 CRLF(不制造混合行尾)",
+        v7.files[p7].includes("author: duan\r\n---\r\n") && !/author: duan\n---/.test(v7.files[p7]),
+        JSON.stringify(v7.files[p7].slice(0, 100)));
+
+      console.log("  — 按账户: 两个号各写各的作者");
+      const v8 = dv3();
+      const W8a = new I.DiaryWriter({ app: { vault: v8 }, settings: {} }, null, { id: "a1", label: "甲", diary: { author: "heigao", diaryFolder: "甲" } });
+      const W8b = new I.DiaryWriter({ app: { vault: v8 }, settings: {} }, null, { id: "a2", label: "乙", diary: { author: "duan", diaryFolder: "乙" } });
+      await W8a.write("甲的记录", false, DAY3);
+      await W8b.write("乙的记录", false, DAY3);
+      check("author 按账户: 甲的树写 heigao", v8.files[W8a.diaryPath(DAY3)].includes("author: heigao"));
+      check("author 按账户: 乙的树写 duan", v8.files[W8b.diaryPath(DAY3)].includes("author: duan"));
+      check("author 按账户: 两棵树确实是两个文件", W8a.diaryPath(DAY3) !== W8b.diaryPath(DAY3));
+      check("author 在 ACCOUNT_DIARY_FIELDS 里(迁移/垫片/UI 才会带上它)", I.ACCOUNT_DIARY_FIELDS.includes("author"));
+    } finally {
+      global.Date = RDate3;
+      I.setDayStartHour(4);
+    }
+  }
+
   console.log("\n────────────────────────");
   console.log(fail === 0 ? `全部通过 (${pass})` : `${pass} 通过, ${fail} 失败`);
   process.exit(fail === 0 ? 0 : 1);
