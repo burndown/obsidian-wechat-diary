@@ -1,9 +1,14 @@
-# #18 多账户 · 真机测试计划（0.5.0-beta.1）
+# #18 多账户 · 真机测试计划（0.5.0-beta.2）
 
 > 面向：谷雨，在自己真实的库 + 两个真实微信号上验。
-> 分支 `feat/multi-account`，版本 `0.5.0-beta.1`（**预发布**，不动 `main`——`main` 仍是上游 0.4.0）。
+> 分支 `feat/multi-account`，版本 `0.5.0-beta.2`（**预发布**，不动 `main`——`main` 仍是上游 0.4.0）。
 > 设计稿 `18-multi-account-draft.md`；决策 `00-decisions.md` D15。
-> 自动测已覆盖 739 条（bindtest）+ 92 条（webcliptest）；**本文件的重点正是那些自动测不到的**（§5）。
+> 自动测已覆盖 744 条（bindtest）+ 92 条（webcliptest）；**本文件的重点正是那些自动测不到的**（§5）。
+>
+> **beta.1 → beta.2 修了一个真机才发现的 bug**：账户密钥名里用了冒号，而 Obsidian 的密钥存储只收
+> 小写字母 / 数字 / 破折号，于是**一绑定就报「登录出错: 密钥 ID 无效」**。beta.2 已修，并把这条宿主
+> 规则**加进了测试桩**——从此同类错误在测试阶段就会被拦下，不必等真机。
+> 已经装了 beta.1 的话，按 §1 覆盖成 beta.2 再继续即可；测试计划本身没变。
 >
 > **本文件里的命令按 `fish` 写**（你用的就是 fish；`set VAR 值` 而不是 `VAR=值`）。
 > 用 bash/zsh 的话：`set A B` → `A=B`，`for f in x y` … `end` → `for f in x y; do` … `done`，
@@ -32,7 +37,7 @@ grep '"version"' $PLUGIN/manifest.json
 
 ```fish
 for f in main.js manifest.json styles.css
-    curl -fsSL -o $PLUGIN/$f https://github.com/burndown/obsidian-wechat-diary/releases/download/0.5.0-beta.1/$f
+    curl -fsSL -o $PLUGIN/$f https://github.com/burndown/obsidian-wechat-diary/releases/download/0.5.0-beta.2/$f
 end
 ```
 
@@ -45,14 +50,14 @@ end
 <summary>方式 B：装了 <code>gh</code> 的话（一行）</summary>
 
 ```fish
-gh release download 0.5.0-beta.1 --repo burndown/obsidian-wechat-diary -D $PLUGIN --clobber
+gh release download 0.5.0-beta.2 --repo burndown/obsidian-wechat-diary -D $PLUGIN --clobber
 ```
 </details>
 
 <details>
 <summary>方式 C：BRAT</summary>
 
-BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，**并允许预发布版本**（`0.5.0-beta.1` 是
+BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，**并允许预发布版本**（`0.5.0-beta.2` 是
 Pre-release，不开这个开关 BRAT 找不到它）。四个 AI 版本的 Release 已经删掉，所以不会再装错成别的版本。
 </details>
 

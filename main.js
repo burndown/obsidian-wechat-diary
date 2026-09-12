@@ -2347,8 +2347,14 @@ const SECRET_BIND_ID = "wechat-diary-bind-identity";
 // 密钥 key 加账户后缀。**旧的无后缀 key 保留不动**(0.4.0 的代码只认它): 万一用户回退到 0.4.0,
 // 绑定照样能用。第一个账户读不到新 key 时回落到旧 key, 于是"老用户无感升级"不需要拷贝密钥。
 // 第二个账户**绝不回落** —— 否则它会拿到第一个账户的 token。
-const ACCOUNT_TOKEN_KEY = (id) => SECRET_BOT_TOKEN + ":" + id;
-const ACCOUNT_IDENTITY_KEY = (id) => SECRET_BIND_ID + ":" + id;
+// ⚠️ Obsidian 的 SecretStorage **只接受小写字母 / 数字 / 破折号, 最长 64 字符** —— 这里原来是
+// `SECRET_BOT_TOKEN + ":" + id`, 冒号非法, 真机上一绑定就弹「密钥 ID 无效。请仅使用小写字母、
+// 数字和破折号，最多 64 个字符」。当时的测试桩是个来者不拒的普通对象, 所以 739 条断言全过也没抓到
+// (现在 tests/bindtest.js 里强制同一条规则)。
+// 后缀顺手规整一遍: 手改过 data.json 的 id 也不该让密钥读写整个失败。
+const accountKeySuffix = (id) => String(id == null ? "" : id).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 12) || "a1";
+const ACCOUNT_TOKEN_KEY = (id) => SECRET_BOT_TOKEN + "-" + accountKeySuffix(id);
+const ACCOUNT_IDENTITY_KEY = (id) => SECRET_BIND_ID + "-" + accountKeySuffix(id);
 const FIRST_ACCOUNT_ID = "a1";
 // 老 data.json 里这几个"日记设置"字段从第 2 步起归每个账户所有(docs/18 §2)。
 // 第 1 步先把它们原样拷进账户, writer/clipper/提醒仍然读全局那份 —— 行为一字不变。

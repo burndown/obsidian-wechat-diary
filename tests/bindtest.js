@@ -125,11 +125,20 @@ Module._load = function (req, ...rest) {
 const WechatDiaryPlugin = require(path.join(__dirname, "..", "main.js"));
 
 // ── 假 app: secretStorage 是进程级的(模拟"卸载插件不删 secret") ──────────────
+// ⚠️ Obsidian 的 SecretStorage 只接受**小写字母 / 数字 / 破折号**、最长 64 字符。这个桩必须跟宿主
+// 一样严格 —— 它原来是个来者不拒的普通对象, 于是"用冒号拼账户后缀"这种错一路穿过了 739 条断言,
+// 直到真机上第一次绑定才弹「密钥 ID 无效」。**桩比宿主宽松, 就是在骗自己。**
+const SECRET_ID_RE = /^[a-z0-9-]{1,64}$/;
+function checkSecretId(k) {
+  if (!SECRET_ID_RE.test(String(k))) {
+    throw new Error("密钥 ID 无效。请仅使用小写字母、数字和破折号，最多 64 个字符。");
+  }
+}
 function makeApp(secrets) {
   return {
     secretStorage: {
-      getSecret: (k) => (k in secrets ? secrets[k] : null),
-      setSecret: (k, v) => { secrets[k] = v; },
+      getSecret: (k) => { checkSecretId(k); return (k in secrets ? secrets[k] : null); },
+      setSecret: (k, v) => { checkSecretId(k); secrets[k] = v; },
     },
     workspace: { onLayoutReady: (cb) => { pendingLayout.push(cb); } },
     vault: { getAbstractFileByPath: () => null },
@@ -167,9 +176,9 @@ async function newPlugin(secrets, storedData) {
   await p.onLoginConfirmed({ botToken: "TOK1", botId: "B1", userId: "U1", baseUrl: "https://x.example" });
   check("bindState() === bound", p.bindState() === "bound", p.bindState());
   // D18: 凭据按账户分层(key 加 :a1 后缀); 旧的无后缀 key 不写, 留给"回退到 0.4.0 仍能用"
-  check("token 进了 secretStorage(账户 key)", s1[SECRET_TOKEN + ":a1"] === "TOK1", JSON.stringify(s1[SECRET_TOKEN + ":a1"]));
+  check("token 进了 secretStorage(账户 key)", s1[SECRET_TOKEN + "-a1"] === "TOK1", JSON.stringify(s1[SECRET_TOKEN + "-a1"]));
   check("不再往旧的无后缀 key 写 token", s1[SECRET_TOKEN] === undefined, JSON.stringify(s1[SECRET_TOKEN]));
-  check("身份也进了 secretStorage(账户 key)", !!s1[SECRET_ID + ":a1"], JSON.stringify(s1[SECRET_ID + ":a1"]));
+  check("身份也进了 secretStorage(账户 key)", !!s1[SECRET_ID + "-a1"], JSON.stringify(s1[SECRET_ID + "-a1"]));
   check("身份内容正确", (p.getBindIdentity() || {}).userId === "U1");
   const dataAfterBind = p._stored;
 
@@ -1611,13 +1620,31 @@ async function newPlugin(secrets, storedData) {
     check("D18 a2 不回落(否则两个微信串号)—— 读到空", pIso.getBotToken("a2") === "", JSON.stringify(pIso.getBotToken("a2")));
     check("D18 a2 的身份也不回落", pIso.getBindIdentity("a2") === null);
     pIso.setBotToken("TOK-A2", "a2");
-    check("D18 a2 写自己的 key", sIso[SECRET_TOKEN + ":a2"] === "TOK-A2" && sIso[SECRET_TOKEN] === "TOK-A1", JSON.stringify(Object.keys(sIso)));
+    check("D18 a2 写自己的 key", sIso[SECRET_TOKEN + "-a2"] === "TOK-A2" && sIso[SECRET_TOKEN] === "TOK-A1", JSON.stringify(Object.keys(sIso)));
     check("D18 a2 写入后 a1 不受影响", pIso.getBotToken("a1") === "TOK-A1" && pIso.getBotToken("a2") === "TOK-A2");
     check("D18 不带 id 时落在当前账户(a1)", pIso.getBotToken() === "TOK-A1");
     pIso.setBotToken("", "a1");   // 解绑 a1
     check("D18 解绑把旧 key 一起清掉(否则回落会让刚解绑的绑定复活)",
-      sIso[SECRET_TOKEN + ":a1"] === "" && sIso[SECRET_TOKEN] === "", JSON.stringify(sIso));
+      sIso[SECRET_TOKEN + "-a1"] === "" && sIso[SECRET_TOKEN] === "", JSON.stringify(sIso));
     check("D18 解绑 a1 后 a1 读到空、a2 不受影响", pIso.getBotToken("a1") === "" && pIso.getBotToken("a2") === "TOK-A2");
+
+    // ── 密钥名的宿主规则(真机实测踩到过) ──
+    // 原来用冒号拼账户后缀(`...-bot-token:a1`), 真机第一次绑定就弹
+    // 「密钥 ID 无效。请仅使用小写字母、数字和破折号，最多 64 个字符」——
+    // 当时的桩来者不拒, 739 条断言全过也没抓到。桩现在会拦, 这里再把规则写进断言:
+    // 桩哪天又被放松, 这几条仍然盯着。
+    check("D18 账户密钥名符合 Obsidian 规则(小写/数字/破折号, ≤64)",
+      [I.ACCOUNT_TOKEN_KEY("a1"), I.ACCOUNT_TOKEN_KEY("a2"), I.ACCOUNT_IDENTITY_KEY("a1"), I.ACCOUNT_IDENTITY_KEY("a2")]
+        .every((k) => /^[a-z0-9-]{1,64}$/.test(k)),
+      JSON.stringify([I.ACCOUNT_TOKEN_KEY("a1"), I.ACCOUNT_IDENTITY_KEY("a1")]));
+    check("D18 账户密钥名不含冒号(踩过的坑)",
+      !I.ACCOUNT_TOKEN_KEY("a1").includes(":") && !I.ACCOUNT_IDENTITY_KEY("a1").includes(":"));
+    check("D18 账户密钥名按账户唯一",
+      I.ACCOUNT_TOKEN_KEY("a1") !== I.ACCOUNT_TOKEN_KEY("a2") && I.ACCOUNT_IDENTITY_KEY("a1") !== I.ACCOUNT_IDENTITY_KEY("a2"));
+    check("D18 账户 #1 的新 key 与旧 key 不同名(回落靠代码而不是同名)",
+      I.ACCOUNT_TOKEN_KEY("a1") !== "wechat-diary-ilink-bot-token");
+    check("D18 手改出来的怪 id 也拼不出非法 key(兜底规整)",
+      /^[a-z0-9-]{1,64}$/.test(I.ACCOUNT_TOKEN_KEY("A_1 !")), I.ACCOUNT_TOKEN_KEY("A_1 !"));
 
     console.log("  — D18.5 unbind 重置 data 之后账户层仍在(没有 secretStorage 的宿主)");
     const appNoSec = makeApp({});
@@ -1733,7 +1760,7 @@ async function newPlugin(secrets, storedData) {
     const mkTwo = async (diaryA, diaryB) => {
       const secrets = {
         [SECRET_TOKEN]: "TOK-A",
-        "wechat-diary-ilink-bot-token:a2": "TOK-B",
+        "wechat-diary-ilink-bot-token-a2": "TOK-B",
       };
       const p = await newPlugin(secrets, BOUND_DATA());
       p.data.accounts[0].ilink.userId = "U1";
@@ -1896,9 +1923,9 @@ async function newPlugin(secrets, storedData) {
     const mkTwo = async (diaryA, diaryB, secretsIn) => {
       const secrets = secretsIn || {
         [SECRET_TOKEN]: "TOK-A",
-        [SECRET_TOKEN + ":a2"]: "TOK-B",
+        [SECRET_TOKEN + "-a2"]: "TOK-B",
         [SECRET_ID]: JSON.stringify({ userId: "U1", botId: "B1", baseUrl: "https://a.example" }),
-        [SECRET_ID + ":a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "https://b.example" }),
+        [SECRET_ID + "-a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "https://b.example" }),
       };
       const p = await newPlugin(secrets, BOUND_DATA());
       p.data.accounts[0].ilink.userId = "U1";
@@ -1994,7 +2021,7 @@ async function newPlugin(secrets, storedData) {
     check("D18-5 上限提示写明了原因与上限", notices.length > noticesBefore && notices[notices.length - 1].includes("最多 5 个"), notices[notices.length - 1]);
 
     console.log("  — D18-5.5 删除账户: 摘数据/密钥/管道, 绝不碰 vault 文件与其它账户");
-    const sDel = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + ":a2"]: "TOK-B", [SECRET_ID + ":a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "" }) };
+    const sDel = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + "-a2"]: "TOK-B", [SECRET_ID + "-a2"]: JSON.stringify({ userId: "U2", botId: "B2", baseUrl: "" }) };
     const pDel = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" }, sDel);
     const cDel = { destroyed: false, destroyAll() { this.destroyed = true; }, notify() {} };
     pDel.pipelines.a2.client = cDel; pDel.pipelines.a2.running = true;
@@ -2003,14 +2030,14 @@ async function newPlugin(secrets, storedData) {
     check("D18-5 删 a2 后只剩 a1", pDel.data.accounts.length === 1 && pDel.data.accounts[0].id === "a1", JSON.stringify(pDel.data.accounts.map((x) => x.id)));
     check("D18-5 writers.a2 消失、a1 还在", pDel.writers.a2 === undefined && !!pDel.writers.a1);
     check("D18-5 a2 的管道对象也清掉了", pDel.pipelines.a2 === undefined && pDel.pipelines.a1 !== undefined, JSON.stringify(Object.keys(pDel.pipelines)));
-    check("D18-5 a2 的密钥被清(token 与身份都空)", sDel[SECRET_TOKEN + ":a2"] === "" && sDel[SECRET_ID + ":a2"] === "", JSON.stringify(sDel));
+    check("D18-5 a2 的密钥被清(token 与身份都空)", sDel[SECRET_TOKEN + "-a2"] === "" && sDel[SECRET_ID + "-a2"] === "", JSON.stringify(sDel));
     check("D18-5 a1 的数据一个字节没动", JSON.stringify(pDel.data.accounts[0].diary) === a1DiaryBefore, JSON.stringify(pDel.data.accounts[0].diary));
     check("D18-5 a1 的 token/绑定不受影响", pDel.getBotToken("a1") === "TOK-A" && pDel.bindState("a1") === "bound", JSON.stringify([pDel.getBotToken("a1"), pDel.bindState("a1")]));
     check("D18-5 删除后选中的是邻居(不悬空)", pDel.data.activeAccount === "a1", pDel.data.activeAccount);
     check("D18-5 落盘里 a2 也没了", pDel._stored.accounts.length === 1, JSON.stringify(pDel._stored.accounts));
 
     console.log("  — D18-5.6 删最后一个账户: 立刻补一个全新的空账户(= 重置为未绑定)");
-    const pLast = await newPlugin({ [SECRET_TOKEN + ":a1"]: "TOK-ONLY" }, BOUND_DATA());
+    const pLast = await newPlugin({ [SECRET_TOKEN + "-a1"]: "TOK-ONLY" }, BOUND_DATA());
     pLast.data.accounts[0].diary.diaryFolder = "只有这个";
     await pLast.deleteAccount("a1");
     check("D18-5 删完仍有一个账户(垫片/凭据访问器不指向空气)",
@@ -2057,7 +2084,7 @@ async function newPlugin(secrets, storedData) {
     })(), JSON.stringify(tab._treeConflictFor("a1", { diaryFolder: "乙改", pathFormat: "YYYY/YYYY-MM-DD" })));
 
     console.log("  — D18-5.9 单账户解绑/重绑: 只动这一个账户");
-    const sUn = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + ":a2"]: "TOK-B" };
+    const sUn = { [SECRET_TOKEN]: "TOK-A", [SECRET_TOKEN + "-a2"]: "TOK-B" };
     const pUn = await mkTwo({ diaryFolder: "甲" }, { diaryFolder: "乙" }, sUn);
     pUn.data.accounts[1].diary.reminderTime = "22:30";
     await pUn.unbindAccount("a2", false);
