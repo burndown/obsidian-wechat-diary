@@ -166,6 +166,31 @@ end
 | H5 | 把某账户的「作者」清空，发一条到**新的一天** | 新文件**没有** author 行（不多写一行） | 文件片段 |
 | H6 | （若开了「写进已有的每日笔记」）发一条 | 你自己的每日笔记**属性里不被插入 author**，插件只动 `「微信随手记」` 一节 | 文件片段 |
 
+#### H0. 历史文件怎么补（插件不会碰旧文件）
+
+插件**只在它正在写的那一天**的文件里补 author（`_ensureAuthor`），历史文件它永远不会再碰。所以：
+
+| 情况 | 怎么做 |
+|---|---|
+| **今天**的文件（两个账户各一个） | 不用脚本：**从那个号再发一条消息**就补上了 |
+| **以前的历史文件** | 跑仓库里的 `tools/backfill-author.py`：默认只演习，看清楚要改哪些再 `--apply` |
+
+```fish
+# ① 先看要改哪些（演习，不写盘）
+python3 tools/backfill-author.py --vault $VAULT --rule '黑高日记=heigao' --rule '段日记=duan'
+
+# ② 备份这两个文件夹（脚本会改动很多文件，同步盘会看到一批变更）
+cp -R $VAULT/黑高日记 ~/黑高日记.bak
+cp -R $VAULT/段日记 ~/段日记.bak
+
+# ③ 确认无误后真写
+python3 tools/backfill-author.py --vault $VAULT --rule '黑高日记=heigao' --rule '段日记=duan' --apply
+```
+
+规则与插件**完全一致**：只补缺失的 `author`、**绝不覆盖**已有的、不碰正文、值按 YAML 转义、
+CRLF 文件也用 CRLF；默认只补插件建的文件（有 `source: wechat-diary`），你手写的那些要加
+`--include-all` 才补。脚本自带自检（不需要库）：`python3 tools/backfill-author.py --selftest`。
+
 ## 5. 自动测覆盖不到、这次重点看的地方
 
 这些已被"故意改错看用例挂不挂"的变异验证确认过**没有自动兜底**（详见设计稿 §9.2）：
