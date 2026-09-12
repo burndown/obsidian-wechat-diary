@@ -4,41 +4,67 @@
 > 分支 `feat/multi-account`，版本 `0.5.0-beta.1`（**预发布**，不动 `main`——`main` 仍是上游 0.4.0）。
 > 设计稿 `18-multi-account-draft.md`；决策 `00-decisions.md` D15。
 > 自动测已覆盖 739 条（bindtest）+ 92 条（webcliptest）；**本文件的重点正是那些自动测不到的**（§5）。
+>
+> **本文件里的命令按 `fish` 写**（你用的就是 fish；`set VAR 值` 而不是 `VAR=值`）。
+> 用 bash/zsh 的话：`set A B` → `A=B`，`for f in x y` … `end` → `for f in x y; do` … `done`，
+> 其余（`cp` / `grep` / `curl`）两种 shell 一样。
 
 ## 0. 装之前（2 分钟，别跳）
 
-```bash
-VAULT="$HOME/你的库"                      # ← 换成你的库路径
-PLUGIN="$VAULT/.obsidian/plugins/wechat-diary"
+```fish
+# ← 换成你的库路径（注意 fish 用 set，不写等号）
+set VAULT /Users/heigao/Documents/ai_workspace
+set PLUGIN $VAULT/.obsidian/plugins/wechat-diary
 
-# ① 备份：data.json 里是全部设置 + 两个账户的状态；迁移会重写它
-cp "$PLUGIN/data.json" ~/wechat-diary-data.before-multiaccount.json.bak
+# ① 备份：data.json 里是全部设置 + 账户状态；迁移会重写它
+cp $PLUGIN/data.json ~/wechat-diary-data.before-multiaccount.json.bak
+
 # ② 记下当前版本，回退时要照着装回去
-grep '"version"' "$PLUGIN/manifest.json"
+grep '"version"' $PLUGIN/manifest.json
 ```
+
+`$PLUGIN/data.json` 应该成功复制（`ls -l ~/wechat-diary-data.before-multiaccount.json.bak` 有大小就对了）。
+如果报 `No such file`，说明 `$PLUGIN` 不对——先 `ls $VAULT/.obsidian/plugins/` 看插件目录叫什么。
 
 ## 1. 怎么装
 
-**方式 A：手动覆盖三件套**（最稳，不依赖任何工具）
+**方式 A：拉三个文件覆盖**（最稳，不需要 `gh`、不依赖任何工具）
 
-```bash
-gh release download 0.5.0-beta.1 --repo burndown/obsidian-wechat-diary -D "$PLUGIN" --clobber
-# 没装 gh 的话：浏览器打开 https://github.com/burndown/obsidian-wechat-diary/releases/tag/0.5.0-beta.1
-# 下载 main.js / manifest.json / styles.css 三个文件，覆盖进 $PLUGIN
+```fish
+for f in main.js manifest.json styles.css
+    curl -fsSL -o $PLUGIN/$f https://github.com/burndown/obsidian-wechat-diary/releases/download/0.5.0-beta.1/$f
+end
 ```
 
-然后在 Obsidian 里：**设置 → 第三方插件**，把 WeChat Diary 关掉再打开（或 `Ctrl/Cmd+P` → `Reload app without saving`）。
+三个文件都下完（没有报错）后，在 Obsidian 里：**设置 → 第三方插件**，把 WeChat Diary 关掉再打开
+（或 `Ctrl/Cmd+P` → `Reload app without saving`）。
 
-**方式 B：BRAT**（BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，并允许预发布版本）。
+装对了的标志：**插件设置页顶部多出一个「微信账户」区**（0.4.0 那儿只有一行绑定状态）。
 
-装好后到插件设置页，**应该看到顶部多了一个「微信账户」区**（0.4.0 那里只有一行绑定状态）。
+<details>
+<summary>方式 B：装了 <code>gh</code> 的话（一行）</summary>
+
+```fish
+gh release download 0.5.0-beta.1 --repo burndown/obsidian-wechat-diary -D $PLUGIN --clobber
+```
+</details>
+
+<details>
+<summary>方式 C：BRAT</summary>
+
+BRAT → Add beta plugin → `burndown/obsidian-wechat-diary`，**并允许预发布版本**（`0.5.0-beta.1` 是
+Pre-release，不开这个开关 BRAT 找不到它）。四个 AI 版本的 Release 已经删掉，所以不会再装错成别的版本。
+</details>
 
 ## 2. 随时回退（先看这条，心里有底）
 
-```bash
-gh release download 0.4.0 --repo ArtemisLin/obsidian-wechat-diary -D "$PLUGIN" --clobber
-# 然后重载 Obsidian
+```fish
+for f in main.js manifest.json styles.css
+    curl -fsSL -o $PLUGIN/$f https://github.com/ArtemisLin/obsidian-wechat-diary/releases/download/0.4.0/$f
+end
 ```
+
+然后重载 Obsidian。（`gh` 也行：`gh release download 0.4.0 --repo ArtemisLin/obsidian-wechat-diary -D $PLUGIN --clobber`）
 
 回退后会发生什么，**先说清楚**：
 - 你的**设置在**：`data.json` 里 `settings.diaryFolder` / `pathFormat` / 附件 / 提醒 / 剪藏都还在
